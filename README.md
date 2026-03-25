@@ -9,7 +9,7 @@ Key fratures:
 * windowed bundle adjustement
 * monocular camera supported
 * stereo cameras supported
-* multi-camera coming soon
+* multi-camera supported (requires partial FOV overlap)
 * build for long sequences
 * deep learning based features support
 
