@@ -867,15 +867,16 @@ class VisualOdometry:
             print(f"[CSLAM] Matching time: {matching_time:.2f} seconds")
 
 
-        ## Min solver
-        ##if self.use_min_solver:  
-        #result = self.min_solver(image, self.keyframe_id, self.frame_t0, self.frame_t1)
-        ## Update frame tracking after successful min solver
-        #if result[0][1] is not None:  # Check if result is not None
-        #    self.frame_t0 = copy.deepcopy(self.frame_t1)
-        ##return result, self.log_data
-        #if self.use_min_solver:
-        #    return result, self.log_data
+        # Min solver
+        if self.use_min_solver:  
+            result = self.min_solver(image, self.keyframe_id, self.frame_t0, self.frame_t1)
+
+            if result[0][1] is not None:  # Check if result is not None
+                self.frame_t0 = copy.deepcopy(self.frame_t1)
+                return result, self.log_data
+            
+            else:
+                return [[image, None, None, None, None, None]], self.log_data
 
 
             
@@ -995,7 +996,9 @@ class VisualOdometry:
                     self.keyframes_ids.pop(min(reg_image_ids), None)
                     #if _ == 0:
                     #    self.keyframes_master_ids.pop(min(reg_image_ids))
-                    self.clean_database(image_id=min(reg_image_ids))
+                    
+                    if self.config['general']['clean_db']:
+                        self.clean_database(image_id=min(reg_image_ids))
                     #print(self.keypoints.keys());quit()
 
                 self.log_data['reconstruction_stats']['successful_reconstructions'] += 1

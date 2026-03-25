@@ -5,6 +5,7 @@ general:
     save_keyframes: False
     min_solver: False
     no_stereo_constraint_in_local_ba: True # Run default solver in local BA
+    clean_db: False
 
 local_features:
     features_name: aliked # choices=['aliked', 'superpoint_open', 'superpoint', 'orb']
