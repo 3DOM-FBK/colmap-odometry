@@ -1,6 +1,6 @@
 # Colmap-Odometry
 
-Colmap-Odometry is a visual odometry framewoek based on pycolmap and is mainly intended for the development and testing of new SLAM features (deep-learning based tie points and matching, keyframe selection, global optimization, etc).
+Colmap-Odometry is a visual odometry framework based on pycolmap and is mainly intended for the development and testing of new VO/SLAM features (deep-learning based tie points and matching, keyframe selection, global optimization, etc).
 
 Feel free to join the project!
 
@@ -15,7 +15,7 @@ Key fratures:
 
 
 ## Installation
-For installing colmap-slam, we recommend using [uv](https://docs.astral.sh/uv/) for fast and reliable package management:
+For installing colmap-odometry, we recommend using [uv](https://docs.astral.sh/uv/) for fast and reliable package management:
 
 ```bash
 # Install uv if you haven't already
@@ -26,7 +26,7 @@ uv venv --python 3.10
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 ```
 
-Then, you can install colmap-slam using uv:
+Then, you can install colmap-odometry using uv:
 
 ```bash
 uv pip install -e .
@@ -41,7 +41,6 @@ Check that cuda is available in `pytorch`, or manually install pytorch from http
 ```
 python ./main.py -c ./config/config_carla.yaml -a ./calibration/calibration_carla.yaml -r ./calibration/camera_rig_carla.yaml -i ./assets/sample_carla_dataset -w ./assets/output
 ```
-In the working directory `raw_data` is expected a folder called `images` containing a folder for each camera, for instance `cam0` and `cam1`.
 
 The full trajectory is stored in the output folder: `trajectory.txt` in world reference system or `images.txt` following COLMAP conventions.
 
