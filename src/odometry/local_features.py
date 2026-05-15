@@ -290,14 +290,21 @@ class LocalFeatures:
             return self.superpoint_open(img_name, image)
         elif self.feature_name == "orb":
             return self.orb(img_name, image)
-    
-    def decriptor_dim(self) -> int:
+
+    @property
+    def descriptor_dim(self) -> int:
         if self.feature_name == "superpoint":
             return 256
-        elif self.feature_name == "aliked":
+        if self.feature_name == "aliked":
             return 128
-        elif self.feature_name == "superpoint_open":
+        if self.feature_name == "superpoint_open":
             return 256
-        elif self.feature_name == "orb":
+        if self.feature_name == "orb":
             return 32
+        raise ValueError(f"Unknown local feature type: {self.feature_name}")
+
+    # Backward-compatible alias (keeps the historical typo).
+    @property
+    def decriptor_dim(self) -> int:
+        return self.descriptor_dim
         

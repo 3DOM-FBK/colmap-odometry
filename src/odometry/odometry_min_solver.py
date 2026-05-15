@@ -757,8 +757,8 @@ class VisualOdometry:
                 camera_id = c + 1
                 num_features, reading_images_status = self._extract_and_store(slave_name, images[c])
                 if not reading_images_status:
-                    self.keypoints[slave_name] = np.empty((0, 2), dtype=np.float32)
-                    self.descriptors[slave_name] = np.empty((0, self.local_features.decriptor_dim), dtype=np.float32)
+                    self.keypoints[slave_name] = torch.empty((0, 2), dtype=torch.float32)
+                    self.descriptors[slave_name] = torch.empty((0, self.local_features.descriptor_dim), dtype=torch.float32)
                     self.log_data['current_frame']['corrupted_slave_image'] = True
                 self.write_keypoints_to_db(self.db, slave_name, slave_id, camera_id, self.keypoints)
 
