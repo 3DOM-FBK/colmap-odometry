@@ -1,6 +1,7 @@
 import os
 import cv2
 import yaml
+import time
 import argparse
 import numpy as np
 from tqdm import tqdm
@@ -142,7 +143,10 @@ if __name__ == "__main__":
     profiler = cProfile.Profile()
     profiler.enable()
 
+    start_time = time.time()
     main()
+    end_time = time.time()
+    print(f"Total execution time: {end_time - start_time:.2f} seconds")
 
     profiler.disable()
     
