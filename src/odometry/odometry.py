@@ -55,7 +55,6 @@ class VisualOdometry:
         self.config = config
         self.camera_config = camera_config
         self.use_min_solver = config.get('general', {}).get('min_solver', True)
-        self.baseline = config['mapping']['baseline']
         self.log = config['general']['log']
         self.rig_match_rule = config['mapping']['rig_match_rule']
         self.height, self.width = camera_config['cam0']['height'], camera_config['cam0']['width']
@@ -64,6 +63,7 @@ class VisualOdometry:
         self.current_status = 'initializing'
         self.frame_t0 = None
         self.frame_t1 = None
+        self.baseline = np.linalg.norm(rig_config['cam1']['translation'])
 
         # Enhanced logging data structure
         self.log_data: Dict[str, Any] = {
@@ -844,8 +844,8 @@ class VisualOdometry:
                 camera_id = c + 1
                 num_features, reading_images_status = self._extract_and_store(slave_name, images[c])
                 if not reading_images_status:
-                    self.keypoints[slave_name] = np.empty((0, 2), dtype=np.float32)
-                    self.descriptors[slave_name] = np.empty((0, self.local_features.decriptor_dim), dtype=np.float32)
+                    self.keypoints[slave_name] = torch.empty((0, 2), dtype=torch.float32)
+                    self.descriptors[slave_name] = torch.empty((0, self.local_features.descriptor_dim), dtype=torch.float32)
                     self.log_data['current_frame']['corrupted_slave_image'] = True
                 self.write_keypoints_to_db(self.db, slave_name, slave_id, camera_id, self.keypoints)
 
@@ -867,15 +867,16 @@ class VisualOdometry:
             print(f"[CSLAM] Matching time: {matching_time:.2f} seconds")
 
 
-        ## Min solver
-        ##if self.use_min_solver:  
-        #result = self.min_solver(image, self.keyframe_id, self.frame_t0, self.frame_t1)
-        ## Update frame tracking after successful min solver
-        #if result[0][1] is not None:  # Check if result is not None
-        #    self.frame_t0 = copy.deepcopy(self.frame_t1)
-        ##return result, self.log_data
-        #if self.use_min_solver:
-        #    return result, self.log_data
+        # Min solver
+        if self.use_min_solver:  
+            result = self.min_solver(image, self.keyframe_id, self.frame_t0, self.frame_t1)
+
+            if result[0][1] is not None:  # Check if result is not None
+                self.frame_t0 = copy.deepcopy(self.frame_t1)
+                return result, self.log_data
+            
+            else:
+                return [[image, None, None, None, None, None]], self.log_data
 
 
             
@@ -995,7 +996,9 @@ class VisualOdometry:
                     self.keyframes_ids.pop(min(reg_image_ids), None)
                     #if _ == 0:
                     #    self.keyframes_master_ids.pop(min(reg_image_ids))
-                    self.clean_database(image_id=min(reg_image_ids))
+                    
+                    if self.config['general']['clean_db']:
+                        self.clean_database(image_id=min(reg_image_ids))
                     #print(self.keypoints.keys());quit()
 
                 self.log_data['reconstruction_stats']['successful_reconstructions'] += 1
