@@ -55,7 +55,6 @@ class VisualOdometry:
         self.config = config
         self.camera_config = camera_config
         self.use_min_solver = config.get('general', {}).get('min_solver', True)
-        self.baseline = config['mapping']['baseline']
         self.log = config['general']['log']
         self.rig_match_rule = config['mapping']['rig_match_rule']
         self.height, self.width = camera_config['cam0']['height'], camera_config['cam0']['width']
@@ -64,6 +63,7 @@ class VisualOdometry:
         self.current_status = 'initializing'
         self.frame_t0 = None
         self.frame_t1 = None
+        self.baseline = np.linalg.norm(rig_config['cam1']['translation'])
 
         # Enhanced logging data structure
         self.log_data: Dict[str, Any] = {

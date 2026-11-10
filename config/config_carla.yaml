@@ -38,7 +38,6 @@ mapping:
     rig_match_rule:
         - ["cam0", "cam1"]
     cameras_for_baseline_estim: ["cam0", "cam1"]
-    baseline: 1.40
     sliding_window: 10 # 10 default
     max_match_distance: 1
     max_keyframes: 1000000

@@ -1,7 +1,7 @@
 general:
     test: False
     log: True
-    frames_range: [10, 3600] # -1 means all frames, 50 for tests
+    frames_range: [10, 1000] # -1 means all frames, 50 for tests
     save_keyframes: False
     min_solver: False
     no_stereo_constraint_in_local_ba: True # Run default solver in local BA
@@ -9,14 +9,14 @@ general:
 
 
 local_features:
-    features_name: aliked # choices=['aliked', 'superpoint_open', 'superpoint', 'orb']
+    features_name: superpoint # choices=['aliked', 'superpoint_open', 'superpoint', 'orb']
     resize_width: 752 # tested with 640, full 1920
-    resize_height: 450 # tested with 480, full 1080
+    resize_height: 480 # tested with 480, full 1080
     superpoint_open:
         top_k: 500
     superpoint:
         do_resize: True
-        top_k: 500
+        top_k: 2000
     aliked:
         model_name: "aliked-n16" # choices=['aliked-t16', 'aliked-n16', 'aliked-n16rot', 'aliked-n32'], default="aliked-n16rot"
         top_k: 1000
@@ -39,7 +39,6 @@ mapping:
     rig_match_rule:
         - ["cam0", "cam1"]
     cameras_for_baseline_estim: ["cam0", "cam1"]
-    baseline: 0.110078
     sliding_window: 10 # 10 default
     max_match_distance: 1
     max_keyframes: 1000000
