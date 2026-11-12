@@ -14,8 +14,7 @@ colmap_odometry_node:
       - "cam1"
 
     world_frame_id: "map"
-    base_frame_id: "livox"
-    child_frame_id: "livox"
+    body_frame_id: "livox"
     camera_frame_ids:
       - "cam0"
       - "cam1"
@@ -34,22 +33,14 @@ colmap_odometry_node:
     sync_slop: 0.05
     image_encoding: "bgr8"
 
-    save_input_images: false
-    publish_every_frame: true
-    reinitialize_after_frames: -1
     publish_feature_matches: true
-    create_feature_tracks: true
     publish_feature_tracks: true
-    feature_track_publish_min_length: 20
     feature_match_max_features: 1500
     feature_match_max_matches: 500
     save_trajectory_tum: false
     trajectory_tum_path: "/home/p/data/test.tum"
     trajectory_tum_overwrite: true
 
-    performance_diagnostics: true
     performance_log_every_n_frames: 10
     performance_slow_frame_sec: 1.0
     performance_stall_warn_sec: 3.0
-    performance_stall_repeat_sec: 5.0
-    performance_input_gap_warn_sec: 3.0

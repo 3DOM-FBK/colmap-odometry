@@ -2,45 +2,34 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>colmap_odometry</name>
-  <version>1.0.0</version>
-  <description>ROS 2-enabled Colmap-Odometry visual odometry package.</description>
-  <maintainer email="user@example.com">user</maintainer>
+  <version>2.0.0</version>
+  <description>Multi-camera visual odometry on COLMAP geometry with pluggable features.</description>
+  <maintainer email="ptrybala@fbk.eu">Pawel Trybala</maintainer>
   <license>BSD-3-Clause</license>
 
   <depend>rclpy</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>sensor_msgs_py</depend>
-  <depend>nav_msgs</depend>
-  <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
   <depend>message_filters</depend>
   <depend>cv_bridge</depend>
-  <depend>ament_index_python</depend>
   <depend>tf2_ros</depend>
+  <depend>ament_index_python</depend>
   <depend>colmap_odometry_msgs</depend>
 
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
-  <exec_depend>python3-tqdm</exec_depend>
-  <exec_depend>python3-psutil</exec_depend>
-  <exec_depend>launch</exec_depend>
-  <exec_depend>launch_ros</exec_depend>
-
-  <exec_depend>python3-kornia-pip</exec_depend>
+  <!-- Not in the ROS rosdep index; see rosdep/colmap_odometry-pip.yaml. -->
   <exec_depend>python3-pycolmap-pip</exec_depend>
-  <exec_depend>python3-pyceres-pip</exec_depend>
-  <exec_depend>python3-pyquaternion-pip</exec_depend>
-  <exec_depend>python3-torch-pip</exec_depend>
-  <exec_depend>python3-torchvision-pip</exec_depend>
-  <exec_depend>python3-transformers-pip</exec_depend>
-  <exec_depend>python3-enlighten-pip</exec_depend>
-  <exec_depend>python3-einops-pip</exec_depend>
-  <exec_depend>python3-tyro-pip</exec_depend>
+  <!-- Feature backends (torch, lightglue, lomatch) are optional pip extras. -->
 
-  <test_depend>ament_copyright</test_depend>
-  <test_depend>ament_flake8</test_depend>
-  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

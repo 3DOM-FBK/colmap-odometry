@@ -1,2 +1,0 @@
-"""ALIKED network definitions."""
-

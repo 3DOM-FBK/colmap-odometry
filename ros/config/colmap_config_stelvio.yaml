@@ -1,96 +1,34 @@
-general:
-    test: False
-    log: False
-    frames_range: [0, -1]
-    save_keyframes: False
-    # Use stereo triangulation + PnP and bypass reconstruction / bundle adjustment.
-    min_solver: True
-    process_every_frame: True
-    write_colmap_database: False
-    feature_track_publish_min_length: 10
-    no_stereo_constraint_in_local_ba: False
+# Minimal stereo triangulation + PnP profile for the Stelvio stereo rig
+# (native 1920x1200 images).
+stereo_pairs: [[cam0, cam1]]
 
-local_features:
-    features_name: loma
-    # Preserve the Stelvio camera's native 1920x1200 processing dimensions.
-    resize_width: 1920
-    resize_height: 1200
-    loma:
-        model_name: "loma_B128"
-        top_k: 500
-        spatial_grid_rows: 3
-        spatial_grid_cols: 3
-        spatial_candidate_multiplier: 4
-        compile: False
-        filter_threshold: 0.1
-    superpoint_open:
-        top_k: 2000
-    superpoint:
-        do_resize: True
-        top_k: 500
-    aliked:
-        model_name: "aliked-n16"
-        top_k: 1500
-        scores_th: 0.1
-        n_limit: 1500
-    orb:
-        top_k: 1000
-        scaleFactor: 1.2
-        nlevels: 8
-        edgeThreshold: 31
-        firstLevel: 0
-        WTA_K: 2
-        patchSize: 31
-        fastThreshold: 20
-    matcher: loma
-    lightglue_filter_threshold: 0.05
-    lightglue_depth_confidence: 0.95
-    lightglue_width_confidence: 0.99
-    ratio_threshold: 0.95
+features:
+  # Preserve the Stelvio camera's native 1920x1200 processing dimensions.
+  resize: {width: 1920, height: 1200}
+  joint: {name: loma, model: loma_B128, num_keypoints: 500, filter_threshold: 0.1, compile: false}
 
-mapping:
-    cameras: ["cam0", "cam1"]
-    rig_match_rule:
-        - ["cam0", "cam1"]
-    cameras_for_baseline_estim: ["cam0", "cam1"]
-    baseline: 0.26409029167112397
-    stereo_epipolar_max_error_px: 2.0
-    stereo_reprojection_max_error_px: 3.0
-    stereo_min_triangulation_angle_deg: 0.2
-    stereo_min_depth: 0.2
-    stereo_max_depth: 20.0
-    temporal_epipolar_max_error_px: 2.0
-    geometric_verification_method: magsac
-    magsac_confidence: 0.999
-    magsac_max_iterations: 10000
-    pnp_ransac_max_error_px: 3.0
-    structureless_max_iterations: 4
-    structureless_robust_delta_px: 3.0
-    sliding_window: 10
-    max_match_distance: 1
-    max_keyframes: 1000000
-    method: "with_pycolmap_reconstruct"
-    init_max_forward_motion: 0.99
-    init_min_tri_angle: 0.1
-    init_max_error: 100.0
-    init_min_num_inliers: 30
-    abs_pose_max_error: 4.0
-    abs_pose_min_num_inliers: 8
-    abs_pose_min_inlier_ratio: 0.01
-    filter_max_reproj_error: 2.0
-    filter_min_tri_angle: 0.0
-    local_ba_min_tri_angle: 0.0
-    tri_ignore_two_view_tracks: 0
+stereo:
+  epipolar_max_error_px: 2.0
+  reprojection_max_error_px: 3.0
+  min_triangulation_angle_deg: 0.2
+  min_depth: 0.2
+  max_depth: 20.0
 
-bundle_adjustment:
-    max_cost_change_px: 3.0
-    refine_focal_length: False
-    refine_principal_point: False
-    refine_extra_params: False
-    global_max_num_iterations: 25
-    global_max_refinements: 10
+temporal:
+  max_error_px: 2.0
+  confidence: 0.999
+  max_iterations: 10000
 
-covariance:
-    pixel_std_px: 1.0
-    min_points: 6
-    spatial_clusters: 24
+pnp:
+  ransac_max_error_px: 3.0
+
+refinement:
+  pixel_std_px: 1.0
+  robust_delta: 3.0
+  max_iterations: 4
+  min_points: 6
+  spatial_clusters: 24
+
+feature_tracks:
+  enabled: true
+  min_length: 20

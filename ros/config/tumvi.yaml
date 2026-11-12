@@ -51,35 +51,30 @@ colmap_odometry_node:
         0.0, 0.0, 0.0, 1.0
       ]
       queue_depth: 2000
-      pose_history_size: 2000
       wait_timeout_sec: 0.15
       initialization_duration_sec: 0.2
       gravity_magnitude: 9.80665
       align_world_with_gravity: false
-      # Continuous covariance diagonals (noise density squared). High-dynamics
-      # tuning: ~3x the dataset-page inflated TUM-VI densities, because the
-      # IMU propagation is less trustworthy under aggressive motion.
-      # Densities: acc 0.005 m/s^2/sqrt(Hz), gyro 0.0005 rad/s/sqrt(Hz),
-      # acc_bias 0.001 m/s^3/sqrt(Hz), gyro_bias 0.00005 rad/s^2/sqrt(Hz).
-      accel_noise_variance: 2.5e-05
-      gyro_noise_variance: 2.5e-07
-      accel_bias_random_walk_variance: 1.0e-06
-      gyro_bias_random_walk_variance: 2.5e-09
+      # Continuous covariance diagonals (noise density squared), from the
+      # official TUM-VI IMU noise densities: acc 0.0028 m/s^2/sqrt(Hz),
+      # gyro 0.00016 rad/s/sqrt(Hz), acc bias 0.00086 m/s^3/sqrt(Hz),
+      # gyro bias 0.000022 rad/s^2/sqrt(Hz).
+      accel_noise_variance: 7.84e-06
+      gyro_noise_variance: 2.56e-08
+      accel_bias_random_walk_variance: 7.4e-07
+      gyro_bias_random_walk_variance: 4.84e-10
       initial_position_std: 0.01
       initial_velocity_std: 0.25
       initial_orientation_std: 0.03
       initial_gyro_bias_std: 0.01
       initial_accel_bias_std: 0.1
-      # Visual measurement-noise floors. Larger floors inflate the innovation
-      # covariance, which lowers the Mahalanobis distance and lets the visual
-      # correction through during fast motion (and softens it when applied).
-      visual_translation_std_floor: 0.02
-      visual_rotation_std_floor: 0.03
-      # Gate on the squared Mahalanobis distance of the visual correction.
-      # For 6 DoF the chi2 99.99% quantile is ~31, so 100 keeps only truly
-      # catastrophic mismatches out. 25 was far too strict for this dataset
-      # (observed mahalanobis^2=62.99 on dynamic motion).
-      visual_gate_chi2: 1000.0
+      # Floors on the per-frame visual measurement in the filter update; they
+      # match the actual frame-to-frame visual accuracy so that the update
+      # estimates the biases (NIS around its degrees of freedom).
+      visual_translation_std_floor: 0.001
+      visual_rotation_std_floor: 0.0003
+      # Gyro rotation prior floor (per frame) in the visual solve.
+      rotation_factor_std_floor: 0.0003
       maximum_iterations: 4
       convergence_epsilon: 0.00001
       maximum_propagation_step_sec: 0.01
@@ -92,15 +87,10 @@ colmap_odometry_node:
     # rosbag2 offers these image topics as RELIABLE; retain every sample.
     image_qos_reliability: reliable
     image_encoding: "mono8"  # grayscale; cv_bridge converts mono16 bags as well
-    save_input_images: false
-    publish_every_frame: true
-    reinitialize_after_frames: -1
 
     publish_feature_matches: true
     publish_sparse_point_cloud: true
-    create_feature_tracks: false
     publish_feature_tracks: false
-    feature_track_publish_min_length: 5
     feature_match_max_features: 2000
     feature_match_max_matches: 1000
 
@@ -108,9 +98,6 @@ colmap_odometry_node:
     trajectory_tum_path: "/home/p/data/colmap_room1.txt"
     trajectory_tum_overwrite: true
 
-    performance_diagnostics: true
     performance_log_every_n_frames: 10
     performance_slow_frame_sec: 1.0
     performance_stall_warn_sec: 3.0
-    performance_stall_repeat_sec: 5.0
-    performance_input_gap_warn_sec: 3.0

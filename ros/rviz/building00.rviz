@@ -411,41 +411,6 @@ Visualization Manager:
             Reliability Policy: Reliable
             Value: /colmap_odometry_node/feature_matches
           Value: true
-        - Alpha: 1
-          Axes Length: 1
-          Axes Radius: 0.10000000149011612
-          Class: rviz_default_plugins/PoseWithCovariance
-          Color: 255; 110; 40
-          Covariance:
-            Orientation:
-              Alpha: 0.3499999940395355
-              Color: 255; 190; 65
-              Color Style: Unique
-              Frame: Local
-              Offset: 1
-              Scale: 1
-              Value: true
-            Position:
-              Alpha: 0.25
-              Color: 255; 110; 40
-              Scale: 1
-              Value: true
-            Value: true
-          Enabled: false
-          Head Length: 0.20000000298023224
-          Head Radius: 0.07999999821186066
-          Name: Relative-pose covariance
-          Shaft Length: 0.6000000238418579
-          Shaft Radius: 0.029999999329447746
-          Shape: Arrow
-          Topic:
-            Depth: 5
-            Durability Policy: Volatile
-            Filter size: 10
-            History Policy: Keep Last
-            Reliability Policy: Reliable
-            Value: /colmap_odometry_node/relative_pose_covariance
-          Value: false
       Enabled: true
       Name: Diagnostics
     - Alpha: 1

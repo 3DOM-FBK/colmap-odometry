@@ -95,20 +95,11 @@ colmap_odometry_node:
     image_qos_reliability: reliable
     sync_slop: 0.01
     image_encoding: "bgr8"
-    save_input_images: false
-    publish_every_frame: true
-    reinitialize_after_frames: -1
 
     publish_feature_matches: true
     # Accepted stereo triangulations, colored from the left image.
     publish_sparse_point_cloud: true
-    # Stelvio consumes native tracks produced by the same features and temporal
-    # matches used by the minimal-solver route.
-    create_feature_tracks: true
     publish_feature_tracks: true
-    # Match Stelvio admission: histories shorter than this cannot become graph
-    # factors and needlessly consume serialization and frontend work.
-    feature_track_publish_min_length: 20
     feature_match_max_features: 1500
     feature_match_max_matches: 500
 
@@ -116,12 +107,8 @@ colmap_odometry_node:
     trajectory_tum_path: "/home/p/data/irobot/results/building00_colmap.txt"
     trajectory_tum_overwrite: true
 
-    performance_diagnostics: true
+    frame_log_path: "frames.jsonl"
+
     performance_log_every_n_frames: 10
     performance_slow_frame_sec: 1.0
     performance_stall_warn_sec: 3.0
-    performance_stall_repeat_sec: 5.0
-    performance_input_gap_warn_sec: 3.0
-    diagnostics:
-      covariance_log_enabled: true
-      covariance_log_path: "covariance_diagnostics.jsonl"
