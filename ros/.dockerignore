@@ -1,0 +1,13 @@
+# Keep the Docker build context small and clean
+.git
+.venv
+venv
+build
+install
+log
+__pycache__
+*.pyc
+*.so
+assets/output
+work_dir
+output

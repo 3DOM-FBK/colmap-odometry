@@ -1,0 +1,108 @@
+# Example ROS 2 node configuration for a calibrated stereo rig.
+# Copy this file and set the image topics, rig calibration, and T_camera_base
+# for the robot before use.
+colmap_odometry_node:
+  ros__parameters:
+    use_sim_time: false
+    config_file: "config_odometry.yaml"
+    camera_file: "config_cameras_intrinsics.yaml"
+    rig_file: "config_camera_rig.yaml"
+
+    work_dir: "/tmp/colmap_odometry"
+    image_topics: ["/stereo/left/image_raw", "/stereo/right/image_raw"]
+    camera_names: ["cam0", "cam1"]
+
+    world_frame_id: "odom"
+    body_frame_id: "base_link"
+    camera_frame_ids: ["left_camera_optical", "right_camera_optical"]
+    publish_tf: false
+    publish_camera_tf: true
+
+    # Row-major T_camera_base: p_camera = T_camera_base * p_base.
+    # Replace with the calibrated transform from the robot base to cam0.
+    T_camera_base: [
+      0.0, -1.0,  0.0, 0.0,
+      0.0,  0.0, -1.0, 0.0,
+      1.0,  0.0,  0.0, 0.0,
+      0.0,  0.0,  0.0, 1.0
+    ]
+
+    imu:
+      enabled: false
+      topic: "/imu/data"
+      time_offset_sec: 0.0
+      # p_base = T_base_imu * p_imu. Rotation and translation are both used
+      # for base-origin specific-force propagation.
+      T_base_imu: [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0
+      ]
+      queue_depth: 2000
+      # 0 retains IMU samples until consumed by the image processing worker.
+      sample_buffer_size: 0
+      wait_timeout_sec: 0.05
+      initialization_duration_sec: 1.0
+      initialization_max_wait_sec: 2.0
+      initialization_max_gyro_norm: 0.03
+      initialization_max_gyro_std: 0.015
+      initialization_max_accel_std: 0.15
+      gravity_magnitude: 9.80665
+      align_world_with_gravity: true
+      accel_noise_variance: 0.0025
+      gyro_noise_variance: 0.000005
+      accel_bias_random_walk_variance: 0.000001
+      gyro_bias_random_walk_variance: 0.00000001
+      # Gravity is constant; initial_gravity_std lets its direction converge.
+      gravity_random_walk_variance: 0.0
+      initial_position_std: 0.01
+      initial_velocity_std: 0.25
+      initial_orientation_std: 0.03
+      initial_gyro_bias_std: 0.01
+      initial_accel_bias_std: 0.1
+      initial_gravity_std: 0.5
+      visual_translation_std_floor: 0.005
+      visual_rotation_std_floor: 0.01
+      visual_model_translation_std: 0.0
+      visual_model_rotation_std: 0.0
+      visual_nis_soft_threshold: 16.812
+      maximum_iterations: 4
+      convergence_epsilon: 0.00001
+      maximum_propagation_step_sec: 0.01
+      maximum_gap_sec: 0.1
+      prior_maximum_reprojection_error_px: 5.0
+      prior_minimum_inliers: 10
+
+    sync_queue_size: 40
+    sync_slop: 0.01
+    # Zero means an unbounded completed-pair processing queue. The worker
+    # drains it in timestamp arrival order when visual processing is slower
+    # than the cameras.
+    processing_queue_size: 0
+    image_encoding: "bgr8"
+    save_input_images: false
+    publish_every_frame: true
+    reinitialize_after_frames: -1
+
+    publish_feature_matches: true
+    publish_sparse_point_cloud: true
+    create_feature_tracks: true
+    publish_feature_tracks: true
+    feature_track_publish_min_length: 5
+    feature_match_max_features: 1500
+    feature_match_max_matches: 500
+
+    save_trajectory_tum: true
+    trajectory_tum_path: "/tmp/colmap_odometry/trajectory.tum"
+    trajectory_tum_overwrite: true
+
+    performance_diagnostics: true
+    performance_log_every_n_frames: 10
+    performance_slow_frame_sec: 1.0
+    performance_stall_warn_sec: 3.0
+    performance_stall_repeat_sec: 5.0
+    performance_input_gap_warn_sec: 3.0
+    diagnostics:
+      covariance_log_enabled: true
+      covariance_log_path: "covariance_diagnostics.jsonl"

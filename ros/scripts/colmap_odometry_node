@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+
+from colmap_odometry.colmap_odometry_node import main
+
+
+if __name__ == "__main__":
+    main()

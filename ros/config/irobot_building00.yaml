@@ -1,0 +1,127 @@
+colmap_odometry_node:
+  ros__parameters:
+    # Processing timers use wall time; poses retain the recorded image stamps.
+    use_sim_time: false
+    config_file: "colmap_config_irobot.yaml"
+    camera_file: "colmap_calibration_irobot.yaml"
+    rig_file: "colmap_camera_rig_irobot.yaml"
+
+    work_dir: "/home/p/data/irobot/results/colmap_building00_work"
+
+    image_topics:
+      - "/avt_camera/left/image/compressed"
+      - "/avt_camera/right/image/compressed"
+    camera_names: ["cam0", "cam1"]
+
+    world_frame_id: "odom"
+    body_frame_id: "base_link"
+    camera_frame_ids: ["left_cam", "right_cam"]
+    publish_tf: false
+    publish_camera_tf: true
+
+    # p_left_camera = T_camera_base * p_base_link
+    T_camera_base: [
+      0.005491916357, -0.999980508310, -0.002970642698, 0.199956139153,
+      -0.002069136014, 0.002959321709, -0.999993478892, 0.054033225092,
+      0.999982776329, 0.005498030086, -0.002052836359, -0.090968912457,
+      0.0, 0.0, 0.0, 1.0
+    ]
+
+    # Optional image-rate inertial factors. Gyro preintegration and a
+    # motion-gated gravity direction are optimized inside the current-frame
+    # stereo solver; there is no separate post-filter output trajectory.
+    imu:
+      enabled: true
+      topic: /adi/adis16465/imu
+      time_offset_sec: 0.0
+      T_base_imu: [
+        1.0,  0.0,  0.0, 0.0,
+        0.0, -1.0,  0.0, 0.0,
+        0.0,  0.0, -1.0, 0.0,
+        0.0,  0.0,  0.0, 1.0
+      ]
+      queue_depth: 2000
+      sample_buffer_size: 0
+      wait_timeout_sec: 0.05
+      # Use the same short startup calibration interval as the stable
+      # visual-inertial configuration; the sequence begins stationary.
+      initialization_duration_sec: 0.5
+      initialization_max_wait_sec: 1.0
+      initialization_max_gyro_norm: 0.03
+      initialization_max_gyro_std: 0.015
+      initialization_max_accel_std: 0.15
+      gravity_magnitude: 9.80665
+      # Keep the shared iRobot odom frame gravity aligned, matching the
+      # Ellipse-LIO/Stelvio base_link convention. The origin remains the first
+      # visual pose and is still published as odom -> base_link.
+      align_world_with_gravity: false
+      # Continuous noise densities squared. These are the stabilized
+      # high-dynamics values; the IMU process covariance is matched against
+      # well-supported visual innovations per camera interval.
+      accel_noise_variance: 2.5e-05
+      gyro_noise_variance: 2.5e-07
+      accel_bias_random_walk_variance: 1.0e-06
+      gyro_bias_random_walk_variance: 2.5e-09
+      # Gravity is constant; initial_gravity_std lets its direction converge.
+      gravity_random_walk_variance: 0.0
+      initial_position_std: 0.01
+      initial_velocity_std: 0.25
+      initial_orientation_std: 0.03
+      initial_gyro_bias_std: 0.01
+      initial_accel_bias_std: 0.1
+      initial_gravity_std: 0.5
+      visual_translation_std_floor: 0.005
+      visual_rotation_std_floor: 0.005
+      visual_model_translation_std: 0.0
+      visual_model_rotation_std: 0.0
+      visual_nis_soft_threshold: 16.812
+      maximum_iterations: 4
+      convergence_epsilon: 0.00001
+      maximum_propagation_step_sec: 0.01
+      maximum_gap_sec: 0.1
+      prior_maximum_reprojection_error_px: 5.0
+      prior_minimum_inliers: 10
+      rotation_factor_std_floor: 0.003
+      gravity_factor_enabled: true
+      gravity_factor_std: 0.05
+      gravity_factor_window_sec: 0.05
+      gravity_factor_minimum_samples: 3
+      gravity_factor_acceleration_tolerance_mps2: 1.5
+      gravity_factor_max_gyro_norm: 1.0
+
+    sync_queue_size: 40
+    # Bag playback is reliable; image epochs are estimator control inputs and
+    # must not be discarded independently of the sweep reconstructor.
+    image_qos_reliability: reliable
+    sync_slop: 0.01
+    image_encoding: "bgr8"
+    save_input_images: false
+    publish_every_frame: true
+    reinitialize_after_frames: -1
+
+    publish_feature_matches: true
+    # Accepted stereo triangulations, colored from the left image.
+    publish_sparse_point_cloud: true
+    # Stelvio consumes native tracks produced by the same features and temporal
+    # matches used by the minimal-solver route.
+    create_feature_tracks: true
+    publish_feature_tracks: true
+    # Match Stelvio admission: histories shorter than this cannot become graph
+    # factors and needlessly consume serialization and frontend work.
+    feature_track_publish_min_length: 20
+    feature_match_max_features: 1500
+    feature_match_max_matches: 500
+
+    save_trajectory_tum: true
+    trajectory_tum_path: "/home/p/data/irobot/results/building00_colmap.txt"
+    trajectory_tum_overwrite: true
+
+    performance_diagnostics: true
+    performance_log_every_n_frames: 10
+    performance_slow_frame_sec: 1.0
+    performance_stall_warn_sec: 3.0
+    performance_stall_repeat_sec: 5.0
+    performance_input_gap_warn_sec: 3.0
+    diagnostics:
+      covariance_log_enabled: true
+      covariance_log_path: "covariance_diagnostics.jsonl"

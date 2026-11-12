@@ -1,0 +1,2 @@
+"""Core Colmap-Odometry implementation."""
+

@@ -1,0 +1,20 @@
+# GrandTour Alphasense cameras.  The ROS camera_info distortion model is
+# equidistant; COLMAP's equivalent model is OPENCV_FISHEYE with
+# [fx, fy, cx, cy, k1, k2, k3, k4].
+cam0:
+  model: OPENCV_FISHEYE
+  width: 1440
+  height: 1080
+  params: [701.4545727023193, 700.1179107526791,
+           680.2585465191044, 537.6794158094971,
+          -0.03843622792783702, -0.002634177248264113,
+           0.002422949539367233, -0.001382691294699419]
+
+cam1:
+  model: OPENCV_FISHEYE
+  width: 1440
+  height: 1080
+  params: [701.6656970672693, 700.8504216642683,
+           675.8628766265481, 534.6583586732144,
+          -0.04459393782932651, 0.01237852934390858,
+          -0.01313451092983728, 0.003895777285135927]

@@ -1,0 +1,2 @@
+"""Bundled ALIKED feature extractor."""
+

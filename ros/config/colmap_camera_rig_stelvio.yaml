@@ -1,0 +1,9 @@
+# ROS camera poses in the cam0 rig frame (T_rig_camera). Quaternion ordering
+# is x, y, z, w. The wrapper inverts these poses for COLMAP.
+cam0:
+  rotation: [0.0, 0.0, 0.0, 1.0]
+  translation: [0.0, 0.0, 0.0]
+
+cam1:
+  rotation: [0.012390531466161002, -0.003246152737597646, 0.007299335234317535, 0.9998913225583705]
+  translation: [0.26413072215157735, 0.0018539347048574981, -0.005040236009173476]

@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.coverage*
+htmlcov/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+env/
+.env
+.python-version
+.vscode/
+.idea/
+
+# ROS / colcon build products
+build/
+install/
+log/
+
+# Runtime products and large local data
+assets/output/
+work_dir/
+output/
+*.db
+*.db3
+*.sqlite
+*.sqlite3
+*.tum
+trajectory*.txt
+images.txt
+
+# Editors, notebooks, and temporary files
+.ipynb_checkpoints/
+*.swp
+*.swo
+*~
+*.~lock*
+tmp/
+temp/

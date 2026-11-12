@@ -1,0 +1,40 @@
+python3-kornia-pip:
+  ubuntu:
+    pip:
+      packages: ["kornia"]
+python3-pycolmap-pip:
+  ubuntu:
+    pip:
+      packages: ["pycolmap"]
+python3-pyceres-pip:
+  ubuntu:
+    pip:
+      packages: ["pyceres"]
+python3-pyquaternion-pip:
+  ubuntu:
+    pip:
+      packages: ["pyquaternion"]
+python3-torch-pip:
+  ubuntu:
+    pip:
+      packages: ["torch"]
+python3-torchvision-pip:
+  ubuntu:
+    pip:
+      packages: ["torchvision"]
+python3-transformers-pip:
+  ubuntu:
+    pip:
+      packages: ["transformers"]
+python3-enlighten-pip:
+  ubuntu:
+    pip:
+      packages: ["enlighten"]
+python3-einops-pip:
+  ubuntu:
+    pip:
+      packages: ["einops"]
+python3-tyro-pip:
+  ubuntu:
+    pip:
+      packages: ["tyro"]
