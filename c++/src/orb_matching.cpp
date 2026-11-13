@@ -235,7 +235,7 @@ bool estimateMotion(const StereoPoints& prev, const Frame& curr, const cv::Matx3
 
 // ------------------------------------------------------------ visualization --
 // Top view (x right, z forward) of the cam0 positions, auto-scaled to fit.
-cv::Mat drawTrajectory(const std::vector<cv::Point2d>& xz, int size = 600) {
+cv::Mat drawTrajectory(const std::vector<cv::Point2d>& xz, double fps, int size = 600) {
     cv::Mat canvas(size, size, CV_8UC3, cv::Scalar(30, 30, 30));
     if (xz.empty()) return canvas;
 
@@ -258,6 +258,8 @@ cv::Mat drawTrajectory(const std::vector<cv::Point2d>& xz, int size = 600) {
     cv::circle(canvas, toPixel(xz.back()), 5, {0, 0, 255}, -1);
     cv::putText(canvas, "top view (x, z)  span " + cv::format("%.1f m", span),
                 {10, 25}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {255, 255, 255}, 1);
+    cv::putText(canvas, cv::format("%.1f FPS", fps),
+                {10, 50}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 255, 255}, 1);
     return canvas;
 }
 
@@ -270,7 +272,7 @@ int main(int argc, char** argv) {
     }
     const fs::path dataset = argv[1];
     const StereoCalibration calib = loadCalibration(argv[2], argv[3]);
-    const int delay_ms = (argc > 4) ? std::stoi(argv[4]) : 30;
+    const int delay_ms = (argc > 4) ? std::stoi(argv[4]) : 1;
 
     const std::vector<std::string> names = listImages(dataset / "cam0");
     if (names.empty()) {
@@ -287,8 +289,12 @@ int main(int argc, char** argv) {
     StereoPoints prev_points;
     bool has_prev = false;
     bool paused = false;
+    double fps = 0.0;  // smoothed processing rate (excludes the waitKey delay)
 
     for (const auto& name : names) {
+        cv::TickMeter timer;
+        timer.start();
+
         Frame frame;
         if (!loadFrame(dataset, name, *orb, frame)) {
             std::cerr << "Skipping " << name << " (missing cam0 or cam1 image)\n";
@@ -326,7 +332,12 @@ int main(int argc, char** argv) {
                         "  PnP inliers: " + std::to_string(inliers) + "  " + status,
                     {30, 60}, cv::FONT_HERSHEY_SIMPLEX, 1.5, {0, 255, 255}, 3);
         cv::imshow("stereo matches (cam0 | cam1)", canvas);
-        cv::imshow("trajectory", drawTrajectory(trajectory));
+
+        // Processing time of this frame, smoothed over the last frames.
+        timer.stop();
+        const double frame_fps = 1.0 / timer.getTimeSec();
+        fps = (fps == 0.0) ? frame_fps : 0.9 * fps + 0.1 * frame_fps;
+        cv::imshow("trajectory", drawTrajectory(trajectory, fps));
 
         // When paused, any other key steps one frame.
         const int key = cv::waitKey(paused ? 0 : delay_ms);
