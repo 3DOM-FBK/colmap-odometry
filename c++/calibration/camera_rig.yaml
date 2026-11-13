@@ -1,0 +1,9 @@
+# ROS T_leftOptical_camera, quaternion [x,y,z,w]. cam0 is always identity.
+# The rectified baseline is -P_right[0,3]/P_right[0,0] = 0.120181369489 m.
+# The wrapper inverts this ROS camera pose to COLMAP camera-from-rig.
+cam0:
+  rotation: [0.0, 0.0, 0.0, 1.0]
+  translation: [0.0, 0.0, 0.0]
+cam1:
+  rotation: [0.0, 0.0, 0.0, 1.0]
+  translation: [0.140, 0.0, 0.0]

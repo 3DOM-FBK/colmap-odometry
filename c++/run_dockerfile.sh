@@ -12,4 +12,7 @@ docker run -it --rm \
 # Inside the docker container, run the following commands to build and run the project:
 # cmake -S . -B build
 # cmake --build build -j
-# ./build/orb_matching assets/sample_carla_dataset
+./build/orb_matching assets/02_set_with_trajectory/images \
+    calibration/camera_calibration.yaml \
+    calibration/camera_rig.yaml
+

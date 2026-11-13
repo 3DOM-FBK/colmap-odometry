@@ -1,0 +1,12 @@
+# Recorded CameraInfo for the rectified ZED pair. Rectified images use P's
+# pinhole intrinsics and zero distortion, not the raw camera distortion model.
+cam0:
+  model: PINHOLE
+  width: 1920
+  height: 1080
+  params: [960.0, 960.0, 960.0, 540.0]
+cam1:
+  model: PINHOLE
+  width: 1920
+  height: 1080
+  params: [960.0, 960.0, 960.0, 540.0]
