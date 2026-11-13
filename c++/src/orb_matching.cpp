@@ -9,11 +9,13 @@
 //
 // Usage:
 //   ./orb_matching <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml> [delay_ms]
-//                  [--no-gui] [--scale S]
+//                  [--no-gui] [--scale S] [--single-core]
 //
 //   delay_ms      wait between frames in the GUI (default 0 = no wait)
 //   --no-gui      no windows, only terminal output (can be placed anywhere)
 //   --scale S     resize images by S before ORB, e.g. 0.5 = half size (default 1)
+//   --single-core run everything on one core: cam0 and cam1 one after the other
+//                 and no OpenCV internal threads (default: multi-core)
 //   dataset_dir   folder with cam0/ and cam1/ images with matching filenames
 //   calibration   per-camera PINHOLE intrinsics: params = [fx, fy, cx, cy]
 //   rig           ROS-style pose of each camera in the rig (cam0 = identity):
@@ -25,6 +27,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -160,19 +163,33 @@ std::vector<cv::DMatch> matchDescriptors(const cv::Mat& desc_a, const cv::Mat& d
     return good;
 }
 
-bool loadFrame(const fs::path& dataset, const std::string& name, double scale, cv::ORB& orb,
-               Frame& f) {
+// Load, resize and extract ORB for one image.
+void processImage(const fs::path& path, double scale, cv::ORB& orb,
+                  cv::Mat& img, std::vector<cv::KeyPoint>& kp, cv::Mat& desc) {
+    img = cv::imread(path.string(), cv::IMREAD_GRAYSCALE);
+    if (img.empty()) return;
+    if (scale != 1.0) cv::resize(img, img, cv::Size(), scale, scale, cv::INTER_AREA);
+    orb.detectAndCompute(img, cv::noArray(), kp, desc);
+}
+
+// With `parallel`, cam1 is processed on a second thread while this thread
+// processes cam0. Each thread uses its own ORB detector (one detector is not
+// thread-safe). Without it, the two images are processed one after the other.
+bool loadFrame(const fs::path& dataset, const std::string& name, double scale, bool parallel,
+               cv::ORB& orb0, cv::ORB& orb1, Frame& f) {
     f.name = name;
-    f.img0 = cv::imread((dataset / "cam0" / name).string(), cv::IMREAD_GRAYSCALE);
-    f.img1 = cv::imread((dataset / "cam1" / name).string(), cv::IMREAD_GRAYSCALE);
-    if (f.img0.empty() || f.img1.empty()) return false;
-    if (scale != 1.0) {
-        cv::resize(f.img0, f.img0, cv::Size(), scale, scale, cv::INTER_AREA);
-        cv::resize(f.img1, f.img1, cv::Size(), scale, scale, cv::INTER_AREA);
+    auto processCam1 = [&] {
+        processImage(dataset / "cam1" / name, scale, orb1, f.img1, f.kp1, f.desc1);
+    };
+    if (parallel) {
+        auto cam1 = std::async(std::launch::async, processCam1);
+        processImage(dataset / "cam0" / name, scale, orb0, f.img0, f.kp0, f.desc0);
+        cam1.get();  // wait for cam1 (also re-throws any error from that thread)
+    } else {
+        processImage(dataset / "cam0" / name, scale, orb0, f.img0, f.kp0, f.desc0);
+        processCam1();
     }
-    orb.detectAndCompute(f.img0, cv::noArray(), f.kp0, f.desc0);
-    orb.detectAndCompute(f.img1, cv::noArray(), f.kp1, f.desc1);
-    return true;
+    return !f.img0.empty() && !f.img1.empty();
 }
 
 // ------------------------------------------------------------ triangulation --
@@ -278,25 +295,31 @@ cv::Mat drawTrajectory(const std::vector<cv::Point2d>& xz, double fps, int size 
 
 // ---------------------------------------------------------------------- main --
 int main(int argc, char** argv) {
-    // Split the options (--no-gui, --scale S) from the positional arguments.
+    // Split the options from the positional arguments.
     bool gui = true;
+    bool multi_core = true;
     double scale = 1.0;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--no-gui") gui = false;
+        else if (arg == "--single-core") multi_core = false;
         else if (arg == "--scale" && i + 1 < argc) scale = std::stod(argv[++i]);
         else args.push_back(arg);
     }
     if (args.size() < 3 || scale <= 0.0) {
         std::cerr << "Usage: " << argv[0]
                   << " <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml>"
-                     " [delay_ms] [--no-gui] [--scale S]\n";
+                     " [delay_ms] [--no-gui] [--scale S] [--single-core]\n";
         return 1;
     }
+    // Single core: also stop OpenCV from using its own internal threads.
+    if (!multi_core) cv::setNumThreads(1);
+
     const fs::path dataset = args[0];
     const StereoCalibration calib = loadCalibration(args[1], args[2], scale);
-    std::cout << "Image scale: " << scale << "\n";
+    std::cout << "Image scale: " << scale << ", "
+              << (multi_core ? "multi-core" : "single-core") << "\n";
     const int delay_ms = (args.size() > 3) ? std::stoi(args[3]) : 0;  // 0 = no wait
 
     const std::vector<std::string> names = listImages(dataset / "cam0");
@@ -305,7 +328,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    cv::Ptr<cv::ORB> orb = cv::ORB::create(kNumFeatures);
+    // One ORB detector per camera, so both can run in parallel.
+    cv::Ptr<cv::ORB> orb0 = cv::ORB::create(kNumFeatures);
+    cv::Ptr<cv::ORB> orb1 = cv::ORB::create(kNumFeatures);
     if (gui) {
         cv::namedWindow("stereo matches (cam0 | cam1)", cv::WINDOW_NORMAL);
         cv::namedWindow("trajectory", cv::WINDOW_AUTOSIZE);
@@ -323,7 +348,7 @@ int main(int argc, char** argv) {
         timer.start();
 
         Frame frame;
-        if (!loadFrame(dataset, name, scale, *orb, frame)) {
+        if (!loadFrame(dataset, name, scale, multi_core, *orb0, *orb1, frame)) {
             std::cerr << "Skipping " << name << " (missing cam0 or cam1 image)\n";
             continue;
         }

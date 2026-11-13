@@ -9,6 +9,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(OpenCV REQUIRED)
+find_package(Threads REQUIRED)
 
 add_executable(orb_matching src/orb_matching.cpp)
-target_link_libraries(orb_matching PRIVATE ${OpenCV_LIBS})
+target_link_libraries(orb_matching PRIVATE ${OpenCV_LIBS} Threads::Threads)
