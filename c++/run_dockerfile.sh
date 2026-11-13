@@ -14,5 +14,5 @@ docker run -it --rm \
 # cmake --build build -j
 ./build/orb_matching assets/02_set_with_trajectory/images \
     calibration/camera_calibration.yaml \
-    calibration/camera_rig.yaml
+    calibration/camera_rig.yaml --no-gui --scale 0.5
 

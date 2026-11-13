@@ -9,7 +9,11 @@
 //
 // Usage:
 //   ./orb_matching <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml> [delay_ms]
+//                  [--no-gui] [--scale S]
 //
+//   delay_ms      wait between frames in the GUI (default 0 = no wait)
+//   --no-gui      no windows, only terminal output (can be placed anywhere)
+//   --scale S     resize images by S before ORB, e.g. 0.5 = half size (default 1)
 //   dataset_dir   folder with cam0/ and cam1/ images with matching filenames
 //   calibration   per-camera PINHOLE intrinsics: params = [fx, fy, cx, cy]
 //   rig           ROS-style pose of each camera in the rig (cam0 = identity):
@@ -59,14 +63,18 @@ struct StereoPoints {
 };
 
 // ------------------------------------------------------------- calibration --
-cv::Matx33d readIntrinsics(const cv::FileNode& cam) {
+// Intrinsics for images resized by `scale`. Pixel centres are at integer
+// coordinates, so the principal point maps as (c + 0.5) * scale - 0.5.
+cv::Matx33d readIntrinsics(const cv::FileNode& cam, double scale) {
     if (static_cast<std::string>(cam["model"]) != "PINHOLE") {
         throw std::runtime_error("Only the PINHOLE camera model is supported");
     }
     std::vector<double> p;
     cam["params"] >> p;  // fx, fy, cx, cy
-    return {p[0], 0.0, p[2],
-            0.0, p[1], p[3],
+    const double fx = p[0] * scale, fy = p[1] * scale;
+    const double cx = (p[2] + 0.5) * scale - 0.5, cy = (p[3] + 0.5) * scale - 0.5;
+    return {fx, 0.0, cx,
+            0.0, fy, cy,
             0.0, 0.0, 1.0};
 }
 
@@ -92,13 +100,13 @@ cv::FileStorage openYaml(const std::string& path) {
 }
 
 StereoCalibration loadCalibration(const std::string& calibration_file,
-                                  const std::string& rig_file) {
+                                  const std::string& rig_file, double scale) {
     cv::FileStorage calib = openYaml(calibration_file);
     cv::FileStorage rig = openYaml(rig_file);
 
     StereoCalibration c;
-    c.K0 = readIntrinsics(calib["cam0"]);
-    c.K1 = readIntrinsics(calib["cam1"]);
+    c.K0 = readIntrinsics(calib["cam0"], scale);
+    c.K1 = readIntrinsics(calib["cam1"], scale);
 
     // Rig file stores the pose of cam1 in the cam0 frame (T_cam0_cam1).
     std::vector<double> q, t;
@@ -152,11 +160,16 @@ std::vector<cv::DMatch> matchDescriptors(const cv::Mat& desc_a, const cv::Mat& d
     return good;
 }
 
-bool loadFrame(const fs::path& dataset, const std::string& name, cv::ORB& orb, Frame& f) {
+bool loadFrame(const fs::path& dataset, const std::string& name, double scale, cv::ORB& orb,
+               Frame& f) {
     f.name = name;
     f.img0 = cv::imread((dataset / "cam0" / name).string(), cv::IMREAD_GRAYSCALE);
     f.img1 = cv::imread((dataset / "cam1" / name).string(), cv::IMREAD_GRAYSCALE);
     if (f.img0.empty() || f.img1.empty()) return false;
+    if (scale != 1.0) {
+        cv::resize(f.img0, f.img0, cv::Size(), scale, scale, cv::INTER_AREA);
+        cv::resize(f.img1, f.img1, cv::Size(), scale, scale, cv::INTER_AREA);
+    }
     orb.detectAndCompute(f.img0, cv::noArray(), f.kp0, f.desc0);
     orb.detectAndCompute(f.img1, cv::noArray(), f.kp1, f.desc1);
     return true;
@@ -265,14 +278,26 @@ cv::Mat drawTrajectory(const std::vector<cv::Point2d>& xz, double fps, int size 
 
 // ---------------------------------------------------------------------- main --
 int main(int argc, char** argv) {
-    if (argc < 4) {
+    // Split the options (--no-gui, --scale S) from the positional arguments.
+    bool gui = true;
+    double scale = 1.0;
+    std::vector<std::string> args;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--no-gui") gui = false;
+        else if (arg == "--scale" && i + 1 < argc) scale = std::stod(argv[++i]);
+        else args.push_back(arg);
+    }
+    if (args.size() < 3 || scale <= 0.0) {
         std::cerr << "Usage: " << argv[0]
-                  << " <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml> [delay_ms]\n";
+                  << " <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml>"
+                     " [delay_ms] [--no-gui] [--scale S]\n";
         return 1;
     }
-    const fs::path dataset = argv[1];
-    const StereoCalibration calib = loadCalibration(argv[2], argv[3]);
-    const int delay_ms = (argc > 4) ? std::stoi(argv[4]) : 1;
+    const fs::path dataset = args[0];
+    const StereoCalibration calib = loadCalibration(args[1], args[2], scale);
+    std::cout << "Image scale: " << scale << "\n";
+    const int delay_ms = (args.size() > 3) ? std::stoi(args[3]) : 0;  // 0 = no wait
 
     const std::vector<std::string> names = listImages(dataset / "cam0");
     if (names.empty()) {
@@ -281,8 +306,10 @@ int main(int argc, char** argv) {
     }
 
     cv::Ptr<cv::ORB> orb = cv::ORB::create(kNumFeatures);
-    cv::namedWindow("stereo matches (cam0 | cam1)", cv::WINDOW_NORMAL);
-    cv::namedWindow("trajectory", cv::WINDOW_AUTOSIZE);
+    if (gui) {
+        cv::namedWindow("stereo matches (cam0 | cam1)", cv::WINDOW_NORMAL);
+        cv::namedWindow("trajectory", cv::WINDOW_AUTOSIZE);
+    }
 
     cv::Matx44d T_world_cam = cv::Matx44d::eye();  // world = cam0 at the first epoch
     std::vector<cv::Point2d> trajectory{{0.0, 0.0}};
@@ -296,7 +323,7 @@ int main(int argc, char** argv) {
         timer.start();
 
         Frame frame;
-        if (!loadFrame(dataset, name, *orb, frame)) {
+        if (!loadFrame(dataset, name, scale, *orb, frame)) {
             std::cerr << "Skipping " << name << " (missing cam0 or cam1 image)\n";
             continue;
         }
@@ -319,33 +346,46 @@ int main(int argc, char** argv) {
         prev_points = triangulateStereo(frame, calib);
         has_prev = true;
 
-        const cv::Vec3d pos(T_world_cam(0, 3), T_world_cam(1, 3), T_world_cam(2, 3));
-        std::cout << name << ": " << prev_points.points.size() << " stereo points, "
-                  << inliers << " PnP inliers, position [" << pos[0] << ", " << pos[1]
-                  << ", " << pos[2] << "] (" << status << ")\n";
-
-        // Visualize stereo matches and trajectory.
-        cv::Mat canvas;
-        cv::drawMatches(frame.img0, frame.kp0, frame.img1, frame.kp1, prev_points.matches, canvas);
-        cv::putText(canvas,
-                    name + "  stereo pts: " + std::to_string(prev_points.points.size()) +
-                        "  PnP inliers: " + std::to_string(inliers) + "  " + status,
-                    {30, 60}, cv::FONT_HERSHEY_SIMPLEX, 1.5, {0, 255, 255}, 3);
-        cv::imshow("stereo matches (cam0 | cam1)", canvas);
+        // Draw the stereo matches (GUI only).
+        if (gui) {
+            cv::Mat canvas;
+            cv::drawMatches(frame.img0, frame.kp0, frame.img1, frame.kp1,
+                            prev_points.matches, canvas);
+            cv::putText(canvas,
+                        name + "  stereo pts: " + std::to_string(prev_points.points.size()) +
+                            "  PnP inliers: " + std::to_string(inliers) + "  " + status,
+                        {30, 60}, cv::FONT_HERSHEY_SIMPLEX, 1.5, {0, 255, 255}, 3);
+            cv::imshow("stereo matches (cam0 | cam1)", canvas);
+        }
 
         // Processing time of this frame, smoothed over the last frames.
         timer.stop();
         const double frame_fps = 1.0 / timer.getTimeSec();
         fps = (fps == 0.0) ? frame_fps : 0.9 * fps + 0.1 * frame_fps;
+
+        const cv::Vec3d pos(T_world_cam(0, 3), T_world_cam(1, 3), T_world_cam(2, 3));
+        std::cout << name << ": " << prev_points.points.size() << " stereo points, "
+                  << inliers << " PnP inliers, position [" << pos[0] << ", " << pos[1]
+                  << ", " << pos[2] << "] (" << status << "), "
+                  << cv::format("%.1f FPS", fps) << "\n";
+
+        if (!gui) continue;
+
         cv::imshow("trajectory", drawTrajectory(trajectory, fps));
 
         // When paused, any other key steps one frame.
-        const int key = cv::waitKey(paused ? 0 : delay_ms);
+        // delay_ms = 0 uses pollKey(): windows are updated without any wait.
+        const int key = paused ? cv::waitKey(0)
+                               : (delay_ms > 0 ? cv::waitKey(delay_ms) : cv::pollKey());
         if (key == ' ') paused = !paused;
         if (key == 'q' || key == 27) break;
     }
 
-    std::cout << "Done. Press any key in a window to close.\n";
-    cv::waitKey(0);
+    if (gui) {
+        std::cout << "Done. Press any key in a window to close.\n";
+        cv::waitKey(0);
+    } else {
+        std::cout << "Done.\n";
+    }
     return 0;
 }
