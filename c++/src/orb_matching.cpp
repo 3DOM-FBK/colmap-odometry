@@ -11,8 +11,9 @@
 // Usage:
 //   ./orb_matching <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml> [delay_ms]
 //                  [--no-gui] [--scale S] [--sequential | --single-core]
-//                  [--pnp opencv|poselib]
+//                  [--pnp opencv|poselib] [--report]
 //
+//   --report      print a timing table per processing stage at the end
 //   --pnp         resection solver: opencv (solvePnPRansac, default) or
 //                 poselib (P3P in LO-RANSAC + non-linear refinement)
 //   delay_ms      wait between frames in the GUI (default 0 = no wait)
@@ -34,6 +35,8 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -53,6 +56,63 @@ constexpr double kMaxReprojErrorPx = 2.0; // triangulation and PnP threshold
 constexpr double kMinDepth = 0.5;         // metres
 constexpr double kMaxDepth = 80.0;        // metres
 constexpr int kMinPnPInliers = 15;
+
+// ------------------------------------------------------------------ timing --
+// Accumulated wall-clock time per processing stage (printed with --report).
+// Thread-safe, because cam0 and cam1 can be processed on two threads.
+class Timings {
+public:
+    // Fix the row order of the report (stages not declared are appended).
+    void declare(const std::vector<std::string>& stages) {
+        for (const auto& s : stages) {
+            if (stats_.find(s) == stats_.end()) { order_.push_back(s); stats_[s]; }
+        }
+    }
+
+    void add(const std::string& stage, double ms) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (stats_.find(stage) == stats_.end()) order_.push_back(stage);
+        stats_[stage].total_ms += ms;
+        stats_[stage].calls += 1;
+    }
+
+    void print(const std::string& reference_stage) const {
+        const double reference_ms = stats_.count(reference_stage)
+                                        ? stats_.at(reference_stage).total_ms : 0.0;
+        std::cout << "\nTiming report\n"
+                  << cv::format("%-30s %7s %11s %11s %8s\n", "stage", "calls", "mean [ms]",
+                                "total [s]", "share");
+        for (const auto& stage : order_) {
+            const Stat& s = stats_.at(stage);
+            if (s.calls == 0) continue;
+            const double share = reference_ms > 0 ? 100.0 * s.total_ms / reference_ms : 0.0;
+            std::cout << cv::format("%-30s %7d %11.2f %11.2f %7.1f%%\n", stage.c_str(), s.calls,
+                                    s.total_ms / s.calls, s.total_ms / 1000.0, share);
+        }
+        std::cout << "share = stage total / '" << reference_stage << "' total. In parallel mode\n"
+                  << "the per-image stages of cam0 and cam1 overlap, so shares can add up\n"
+                  << "to more than 100%.\n";
+    }
+
+private:
+    struct Stat { double total_ms = 0.0; int calls = 0; };
+    std::map<std::string, Stat> stats_;
+    std::vector<std::string> order_;  // stages in the order they first appear
+    mutable std::mutex mutex_;
+};
+
+// Measures the time from construction to the end of the scope.
+class ScopedTimer {
+public:
+    ScopedTimer(Timings& timings, std::string stage)
+        : timings_(timings), stage_(std::move(stage)) { meter_.start(); }
+    ~ScopedTimer() { meter_.stop(); timings_.add(stage_, meter_.getTimeMilli()); }
+
+private:
+    Timings& timings_;
+    std::string stage_;
+    cv::TickMeter meter_;
+};
 
 // ------------------------------------------------------------- data types --
 struct StereoCalibration {
@@ -172,11 +232,15 @@ std::vector<cv::DMatch> matchDescriptors(const cv::Mat& desc_a, const cv::Mat& d
 }
 
 // Load, resize and extract ORB for one image.
-void processImage(const fs::path& path, double scale, cv::ORB& orb,
+void processImage(const fs::path& path, double scale, cv::ORB& orb, Timings& timings,
                   cv::Mat& img, std::vector<cv::KeyPoint>& kp, cv::Mat& desc) {
-    img = cv::imread(path.string(), cv::IMREAD_GRAYSCALE);
-    if (img.empty()) return;
-    if (scale != 1.0) cv::resize(img, img, cv::Size(), scale, scale, cv::INTER_AREA);
+    {
+        ScopedTimer t(timings, "image load + resize (per img)");
+        img = cv::imread(path.string(), cv::IMREAD_GRAYSCALE);
+        if (img.empty()) return;
+        if (scale != 1.0) cv::resize(img, img, cv::Size(), scale, scale, cv::INTER_AREA);
+    }
+    ScopedTimer t(timings, "ORB extraction (per img)");
     orb.detectAndCompute(img, cv::noArray(), kp, desc);
 }
 
@@ -184,17 +248,18 @@ void processImage(const fs::path& path, double scale, cv::ORB& orb,
 // processes cam0. Each thread uses its own ORB detector (one detector is not
 // thread-safe). Without it, the two images are processed one after the other.
 bool loadFrame(const fs::path& dataset, const std::string& name, double scale, bool parallel,
-               cv::ORB& orb0, cv::ORB& orb1, Frame& f) {
+               cv::ORB& orb0, cv::ORB& orb1, Timings& timings, Frame& f) {
+    ScopedTimer t(timings, "load + ORB (both cameras)");
     f.name = name;
     auto processCam1 = [&] {
-        processImage(dataset / "cam1" / name, scale, orb1, f.img1, f.kp1, f.desc1);
+        processImage(dataset / "cam1" / name, scale, orb1, timings, f.img1, f.kp1, f.desc1);
     };
     if (parallel) {
         auto cam1 = std::async(std::launch::async, processCam1);
-        processImage(dataset / "cam0" / name, scale, orb0, f.img0, f.kp0, f.desc0);
+        processImage(dataset / "cam0" / name, scale, orb0, timings, f.img0, f.kp0, f.desc0);
         cam1.get();  // wait for cam1 (also re-throws any error from that thread)
     } else {
-        processImage(dataset / "cam0" / name, scale, orb0, f.img0, f.kp0, f.desc0);
+        processImage(dataset / "cam0" / name, scale, orb0, timings, f.img0, f.kp0, f.desc0);
         processCam1();
     }
     return !f.img0.empty() && !f.img1.empty();
@@ -206,11 +271,16 @@ double reprojectionError(const cv::Matx34d& P, const cv::Vec4d& X, const cv::Poi
     return std::hypot(x[0] / x[2] - uv.x, x[1] / x[2] - uv.y);
 }
 
-StereoPoints triangulateStereo(const Frame& f, const StereoCalibration& c) {
+StereoPoints triangulateStereo(const Frame& f, const StereoCalibration& c, Timings& timings) {
     StereoPoints out;
-    const std::vector<cv::DMatch> matches = matchDescriptors(f.desc0, f.desc1);
+    std::vector<cv::DMatch> matches;
+    {
+        ScopedTimer t(timings, "stereo matching");
+        matches = matchDescriptors(f.desc0, f.desc1);
+    }
     if (matches.empty()) return out;
 
+    ScopedTimer t(timings, "triangulation + filtering");
     std::vector<cv::Point2d> uv0, uv1;
     for (const auto& m : matches) {
         uv0.push_back(f.kp0[m.queryIdx].pt);
@@ -301,17 +371,23 @@ bool solvePnPPoseLib(const std::vector<cv::Point3d>& object, const std::vector<c
 
 // Pose of cam0 at epoch k w.r.t. cam0 at epoch k-1 (p_k = T * p_{k-1}).
 bool estimateMotion(const StereoPoints& prev, const Frame& curr, const cv::Matx33d& K0,
-                    PnPSolver solver, cv::Matx44d& T_curr_prev, int& num_inliers) {
-    const std::vector<cv::DMatch> matches = matchDescriptors(prev.desc0, curr.desc0);
+                    PnPSolver solver, Timings& timings, cv::Matx44d& T_curr_prev,
+                    int& num_inliers) {
     std::vector<cv::Point3d> object;
     std::vector<cv::Point2d> image;
-    for (const auto& m : matches) {
-        object.push_back(prev.points[m.queryIdx]);
-        image.push_back(curr.kp0[m.trainIdx].pt);
+    {
+        ScopedTimer t(timings, "temporal matching");
+        const std::vector<cv::DMatch> matches = matchDescriptors(prev.desc0, curr.desc0);
+        for (const auto& m : matches) {
+            object.push_back(prev.points[m.queryIdx]);
+            image.push_back(curr.kp0[m.trainIdx].pt);
+        }
     }
     num_inliers = 0;
     if (static_cast<int>(object.size()) < kMinPnPInliers) return false;
 
+    ScopedTimer t(timings, solver == PnPSolver::PoseLib ? "PnP RANSAC (poselib)"
+                                                        : "PnP RANSAC (opencv)");
     const bool ok = (solver == PnPSolver::PoseLib)
         ? solvePnPPoseLib(object, image, K0, curr.img0.size(), T_curr_prev, num_inliers)
         : solvePnPOpenCV(object, image, K0, T_curr_prev, num_inliers);
@@ -356,10 +432,12 @@ int main(int argc, char** argv) {
     bool opencv_threads = true;    // OpenCV's own internal multi-threading
     double scale = 1.0;
     std::string pnp = "opencv";
+    bool report = false;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--no-gui") gui = false;
+        else if (arg == "--report") report = true;
         else if (arg == "--sequential") parallel_cameras = false;
         else if (arg == "--single-core") parallel_cameras = opencv_threads = false;
         else if (arg == "--scale" && i + 1 < argc) scale = std::stod(argv[++i]);
@@ -370,7 +448,7 @@ int main(int argc, char** argv) {
         std::cerr << "Usage: " << argv[0]
                   << " <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml>"
                      " [delay_ms] [--no-gui] [--scale S] [--sequential | --single-core]"
-                     " [--pnp opencv|poselib]\n";
+                     " [--pnp opencv|poselib] [--report]\n";
         return 1;
     }
     const PnPSolver solver = (pnp == "poselib") ? PnPSolver::PoseLib : PnPSolver::OpenCV;
@@ -405,12 +483,18 @@ int main(int argc, char** argv) {
     bool paused = false;
     double fps = 0.0;  // smoothed processing rate (excludes the waitKey delay)
 
+    Timings timings;
+    timings.declare({"frame total", "load + ORB (both cameras)", "image load + resize (per img)",
+                     "ORB extraction (per img)", "temporal matching", "PnP RANSAC (opencv)",
+                     "PnP RANSAC (poselib)", "stereo matching", "triangulation + filtering",
+                     "visualization"});
+
     for (const auto& name : names) {
         cv::TickMeter timer;
         timer.start();
 
         Frame frame;
-        if (!loadFrame(dataset, name, scale, parallel_cameras, *orb0, *orb1, frame)) {
+        if (!loadFrame(dataset, name, scale, parallel_cameras, *orb0, *orb1, timings, frame)) {
             std::cerr << "Skipping " << name << " (missing cam0 or cam1 image)\n";
             continue;
         }
@@ -420,7 +504,8 @@ int main(int argc, char** argv) {
         std::string status = "first frame";
         if (has_prev) {
             cv::Matx44d T_curr_prev;
-            if (estimateMotion(prev_points, frame, calib.K0, solver, T_curr_prev, inliers)) {
+            if (estimateMotion(prev_points, frame, calib.K0, solver, timings, T_curr_prev,
+                               inliers)) {
                 T_world_cam = T_world_cam * T_curr_prev.inv();
                 trajectory.emplace_back(T_world_cam(0, 3), T_world_cam(2, 3));
                 status = "ok";
@@ -430,11 +515,12 @@ int main(int argc, char** argv) {
         }
 
         // Triangulate this epoch for the next one.
-        prev_points = triangulateStereo(frame, calib);
+        prev_points = triangulateStereo(frame, calib, timings);
         has_prev = true;
 
         // Draw the stereo matches (GUI only).
         if (gui) {
+            ScopedTimer t(timings, "visualization");
             cv::Mat canvas;
             cv::drawMatches(frame.img0, frame.kp0, frame.img1, frame.kp1,
                             prev_points.matches, canvas);
@@ -447,6 +533,7 @@ int main(int argc, char** argv) {
 
         // Processing time of this frame, smoothed over the last frames.
         timer.stop();
+        timings.add("frame total", timer.getTimeMilli());
         const double frame_fps = 1.0 / timer.getTimeSec();
         fps = (fps == 0.0) ? frame_fps : 0.9 * fps + 0.1 * frame_fps;
 
@@ -467,6 +554,8 @@ int main(int argc, char** argv) {
         if (key == ' ') paused = !paused;
         if (key == 'q' || key == 27) break;
     }
+
+    if (report) timings.print("frame total");
 
     if (gui) {
         std::cout << "Done. Press any key in a window to close.\n";
