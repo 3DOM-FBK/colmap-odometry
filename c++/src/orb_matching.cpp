@@ -1,16 +1,20 @@
-// Minimal stereo visual odometry with ORB features (OpenCV only).
+// Minimal stereo visual odometry with ORB features (OpenCV + PoseLib).
 //
 // For every pair of consecutive epochs (k-1, k):
 //   1. Stereo: match ORB features between cam0 and cam1 at epoch k-1 and
 //      triangulate them -> 3D points in the cam0 frame of epoch k-1.
 //   2. Temporal: match those points' cam0 descriptors to cam0 at epoch k.
-//   3. Resection: solvePnPRansac gives the pose of cam0 at epoch k with
-//      respect to cam0 at epoch k-1. Chaining these gives the trajectory.
+//   3. Resection: RANSAC PnP (OpenCV or PoseLib) gives the pose of cam0 at
+//      epoch k with respect to cam0 at epoch k-1. Chaining these gives the
+//      trajectory.
 //
 // Usage:
 //   ./orb_matching <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml> [delay_ms]
 //                  [--no-gui] [--scale S] [--sequential | --single-core]
+//                  [--pnp opencv|poselib]
 //
+//   --pnp         resection solver: opencv (solvePnPRansac, default) or
+//                 poselib (P3P in LO-RANSAC + non-linear refinement)
 //   delay_ms      wait between frames in the GUI (default 0 = no wait)
 //   --no-gui      no windows, only terminal output (can be placed anywhere)
 //   --scale S     resize images by S before ORB, e.g. 0.5 = half size (default 1)
@@ -35,9 +39,12 @@
 #include <string>
 #include <vector>
 
+#include <PoseLib/poselib.h>
 #include <opencv2/opencv.hpp>
 
 namespace fs = std::filesystem;
+
+enum class PnPSolver { OpenCV, PoseLib };
 
 // ---------------------------------------------------------------- settings --
 constexpr int kNumFeatures = 2000;
@@ -235,9 +242,66 @@ StereoPoints triangulateStereo(const Frame& f, const StereoCalibration& c) {
 }
 
 // --------------------------------------------------------------- resection --
+// Both solvers return T with p_camera = T * p_points (points' frame -> camera).
+
+bool solvePnPOpenCV(const std::vector<cv::Point3d>& object, const std::vector<cv::Point2d>& image,
+                    const cv::Matx33d& K, cv::Matx44d& T, int& num_inliers) {
+    cv::Mat rvec, tvec, inliers;
+    const bool ok = cv::solvePnPRansac(object, image, cv::Mat(K), cv::noArray(), rvec, tvec,
+                                       false, 1000, kMaxReprojErrorPx, 0.999, inliers);
+    num_inliers = inliers.rows;
+    if (!ok) return false;
+
+    cv::Mat R;
+    cv::Rodrigues(rvec, R);
+    T = cv::Matx44d::eye();
+    for (int r = 0; r < 3; ++r) {
+        for (int col = 0; col < 3; ++col) T(r, col) = R.at<double>(r, col);
+        T(r, 3) = tvec.at<double>(r);
+    }
+    return true;
+}
+
+bool solvePnPPoseLib(const std::vector<cv::Point3d>& object, const std::vector<cv::Point2d>& image,
+                     const cv::Matx33d& K, const cv::Size& image_size, cv::Matx44d& T,
+                     int& num_inliers) {
+    std::vector<Eigen::Vector3d> points3D;
+    std::vector<Eigen::Vector2d> points2D;
+    points3D.reserve(object.size());
+    points2D.reserve(image.size());
+    for (size_t i = 0; i < object.size(); ++i) {
+        points3D.emplace_back(object[i].x, object[i].y, object[i].z);
+        points2D.emplace_back(image[i].x, image[i].y);
+    }
+
+    const poselib::Camera camera("PINHOLE", {K(0, 0), K(1, 1), K(0, 2), K(1, 2)},
+                                 image_size.width, image_size.height);
+    poselib::RansacOptions ransac;
+    ransac.max_reproj_error = kMaxReprojErrorPx;  // pixels
+    ransac.max_iterations = 1000;
+    ransac.success_prob = 0.999;
+    poselib::BundleOptions refinement;            // robust non-linear refinement on inliers
+    refinement.loss_scale = 0.5 * kMaxReprojErrorPx;
+
+    poselib::CameraPose pose;
+    std::vector<char> inliers;
+    const poselib::RansacStats stats = poselib::estimate_absolute_pose(
+        points2D, points3D, camera, ransac, refinement, &pose, &inliers);
+    num_inliers = static_cast<int>(stats.num_inliers);
+    if (num_inliers == 0) return false;
+
+    const Eigen::Matrix3d R = pose.R();
+    T = cv::Matx44d::eye();
+    for (int r = 0; r < 3; ++r) {
+        for (int col = 0; col < 3; ++col) T(r, col) = R(r, col);
+        T(r, 3) = pose.t(r);
+    }
+    return true;
+}
+
 // Pose of cam0 at epoch k w.r.t. cam0 at epoch k-1 (p_k = T * p_{k-1}).
 bool estimateMotion(const StereoPoints& prev, const Frame& curr, const cv::Matx33d& K0,
-                    cv::Matx44d& T_curr_prev, int& num_inliers) {
+                    PnPSolver solver, cv::Matx44d& T_curr_prev, int& num_inliers) {
     const std::vector<cv::DMatch> matches = matchDescriptors(prev.desc0, curr.desc0);
     std::vector<cv::Point3d> object;
     std::vector<cv::Point2d> image;
@@ -248,20 +312,10 @@ bool estimateMotion(const StereoPoints& prev, const Frame& curr, const cv::Matx3
     num_inliers = 0;
     if (static_cast<int>(object.size()) < kMinPnPInliers) return false;
 
-    cv::Mat rvec, tvec, inliers;
-    const bool ok = cv::solvePnPRansac(object, image, cv::Mat(K0), cv::noArray(), rvec, tvec,
-                                       false, 1000, kMaxReprojErrorPx, 0.999, inliers);
-    num_inliers = inliers.rows;
-    if (!ok || num_inliers < kMinPnPInliers) return false;
-
-    cv::Mat R;
-    cv::Rodrigues(rvec, R);
-    T_curr_prev = cv::Matx44d::eye();
-    for (int r = 0; r < 3; ++r) {
-        for (int col = 0; col < 3; ++col) T_curr_prev(r, col) = R.at<double>(r, col);
-        T_curr_prev(r, 3) = tvec.at<double>(r);
-    }
-    return true;
+    const bool ok = (solver == PnPSolver::PoseLib)
+        ? solvePnPPoseLib(object, image, K0, curr.img0.size(), T_curr_prev, num_inliers)
+        : solvePnPOpenCV(object, image, K0, T_curr_prev, num_inliers);
+    return ok && num_inliers >= kMinPnPInliers;
 }
 
 // ------------------------------------------------------------ visualization --
@@ -301,6 +355,7 @@ int main(int argc, char** argv) {
     bool parallel_cameras = true;  // cam0 and cam1 on two threads
     bool opencv_threads = true;    // OpenCV's own internal multi-threading
     double scale = 1.0;
+    std::string pnp = "opencv";
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -308,14 +363,17 @@ int main(int argc, char** argv) {
         else if (arg == "--sequential") parallel_cameras = false;
         else if (arg == "--single-core") parallel_cameras = opencv_threads = false;
         else if (arg == "--scale" && i + 1 < argc) scale = std::stod(argv[++i]);
+        else if (arg == "--pnp" && i + 1 < argc) pnp = argv[++i];
         else args.push_back(arg);
     }
-    if (args.size() < 3 || scale <= 0.0) {
+    if (args.size() < 3 || scale <= 0.0 || (pnp != "opencv" && pnp != "poselib")) {
         std::cerr << "Usage: " << argv[0]
                   << " <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml>"
-                     " [delay_ms] [--no-gui] [--scale S] [--sequential | --single-core]\n";
+                     " [delay_ms] [--no-gui] [--scale S] [--sequential | --single-core]"
+                     " [--pnp opencv|poselib]\n";
         return 1;
     }
+    const PnPSolver solver = (pnp == "poselib") ? PnPSolver::PoseLib : PnPSolver::OpenCV;
     if (!opencv_threads) cv::setNumThreads(1);
 
     const fs::path dataset = args[0];
@@ -323,7 +381,7 @@ int main(int argc, char** argv) {
     const std::string mode = parallel_cameras ? "parallel"
                              : opencv_threads ? "sequential"
                                               : "single-core";
-    std::cout << "Image scale: " << scale << ", mode: " << mode << "\n";
+    std::cout << "Image scale: " << scale << ", mode: " << mode << ", PnP: " << pnp << "\n";
     const int delay_ms = (args.size() > 3) ? std::stoi(args[3]) : 0;  // 0 = no wait
 
     const std::vector<std::string> names = listImages(dataset / "cam0");
@@ -362,7 +420,7 @@ int main(int argc, char** argv) {
         std::string status = "first frame";
         if (has_prev) {
             cv::Matx44d T_curr_prev;
-            if (estimateMotion(prev_points, frame, calib.K0, T_curr_prev, inliers)) {
+            if (estimateMotion(prev_points, frame, calib.K0, solver, T_curr_prev, inliers)) {
                 T_world_cam = T_world_cam * T_curr_prev.inv();
                 trajectory.emplace_back(T_world_cam(0, 3), T_world_cam(2, 3));
                 status = "ok";

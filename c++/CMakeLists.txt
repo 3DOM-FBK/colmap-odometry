@@ -10,6 +10,8 @@ endif()
 
 find_package(OpenCV REQUIRED)
 find_package(Threads REQUIRED)
+find_package(Eigen3 REQUIRED NO_MODULE)  # PoseLib needs it but does not find it itself
+find_package(PoseLib REQUIRED)
 
 add_executable(orb_matching src/orb_matching.cpp)
-target_link_libraries(orb_matching PRIVATE ${OpenCV_LIBS} Threads::Threads)
+target_link_libraries(orb_matching PRIVATE ${OpenCV_LIBS} Threads::Threads PoseLib::PoseLib)
