@@ -1,6 +1,6 @@
-// Minimal stereo visual odometry with ORB features (OpenCV + PoseLib).
+// Minimal visual odometry with ORB features (OpenCV + PoseLib), stereo or mono.
 //
-// For every pair of consecutive epochs (k-1, k):
+// Stereo (cam0/ and cam1/ found), for every pair of consecutive epochs (k-1, k):
 //   1. Stereo: match ORB features between cam0 and cam1 at epoch k-1 and
 //      triangulate them -> 3D points in the cam0 frame of epoch k-1.
 //   2. Temporal: match those points' cam0 descriptors to cam0 at epoch k.
@@ -8,8 +8,16 @@
 //      epoch k with respect to cam0 at epoch k-1. Chaining these gives the
 //      trajectory.
 //
+// Mono (only cam0/ found), for every epoch n:
+//   1. Match cam0 at n-2 and n-1 and triangulate with their known poses
+//      -> 3D points in the world frame.
+//   2. Resection of cam0 at n on those points -> pose at n in the world frame.
+//   Start-up (epoch 1) and recovery after a failure use the essential matrix
+//   between n-1 and n. One camera cannot observe scale: the first translation
+//   is set to length 1, so the trajectory is in arbitrary units.
+//
 // Usage:
-//   ./orb_matching <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml> [delay_ms]
+//   ./orb_matching <dataset_dir> <camera_calibration.yaml> [camera_rig.yaml] [delay_ms]
 //                  [--no-gui] [--scale S] [--sequential | --single-core]
 //                  [--pnp opencv|poselib] [--report]
 //
@@ -22,9 +30,9 @@
 //   --sequential  cam0 and cam1 one after the other, OpenCV internal threads on
 //   --single-core cam0 and cam1 one after the other, OpenCV internal threads off
 //   (default: cam0 and cam1 in parallel, OpenCV internal threads on)
-//   dataset_dir   folder with cam0/ and cam1/ images with matching filenames
+//   dataset_dir   folder with cam0/ (and optionally cam1/) images with matching filenames
 //   calibration   per-camera PINHOLE intrinsics: params = [fx, fy, cx, cy]
-//   rig           ROS-style pose of each camera in the rig (cam0 = identity):
+//   rig           (stereo only) ROS-style pose of each camera in the rig (cam0 = identity):
 //                 p_cam0 = R * p_cam1 + t, quaternion [x, y, z, w]
 //
 // Keys: q / ESC = quit, space = pause / resume, any key while paused = next frame
@@ -35,8 +43,10 @@
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -52,10 +62,10 @@ enum class PnPSolver { OpenCV, PoseLib };
 // ---------------------------------------------------------------- settings --
 constexpr int kNumFeatures = 2000;
 constexpr float kRatioTest = 0.8f;        // Lowe's ratio test
-constexpr double kMaxReprojErrorPx = 2.0; // triangulation and PnP threshold
-constexpr double kMinDepth = 0.5;         // metres
-constexpr double kMaxDepth = 80.0;        // metres
-constexpr int kMinPnPInliers = 15;
+constexpr double kMaxReprojErrorPx = 2.0; // triangulation, PnP and essential matrix threshold
+constexpr double kMinDepth = 0.5;         // metres (stereo only)
+constexpr double kMaxDepth = 80.0;        // metres (stereo only)
+constexpr int kMinInliers = 15;           // for PnP and the essential matrix
 
 // ------------------------------------------------------------------ timing --
 // Accumulated wall-clock time per processing stage (printed with --report).
@@ -115,22 +125,35 @@ private:
 };
 
 // ------------------------------------------------------------- data types --
-struct StereoCalibration {
+struct Calibration {
     cv::Matx33d K0, K1;
-    cv::Matx34d P0, P1;  // projection matrices, cam0 frame = reference
+    cv::Matx34d P0, P1;  // projection matrices, cam0 frame = reference (P1 stereo only)
 };
 
 struct Frame {
     std::string name;
-    cv::Mat img0, img1;
+    cv::Mat img0, img1;  // img1 is empty in mono mode
     std::vector<cv::KeyPoint> kp0, kp1;
     cv::Mat desc0, desc1;
 };
 
-struct StereoPoints {
-    std::vector<cv::Point3d> points;  // in the cam0 frame
-    cv::Mat desc0;                    // cam0 descriptor of each point
-    std::vector<cv::DMatch> matches;  // stereo matches kept (for drawing)
+struct TriangulatedPoints {
+    std::vector<cv::Point3d> points;  // in the frame of the projection matrices used
+    cv::Mat desc;                     // cam0 descriptor of each point (used for the next epoch)
+    std::vector<cv::DMatch> matches;  // matches kept (query = first view, train = second view)
+};
+
+// Result of one epoch, plus what to draw.
+struct StepResult {
+    cv::Matx44d T_world_cam = cv::Matx44d::eye();  // pose of cam0: p_world = T * p_cam
+    bool pose_updated = false;  // false = first frame, or failure with the pose kept
+    std::string status = "first frame";
+    size_t num_points = 0;      // 3D points triangulated in this step
+    int num_inliers = 0;        // PnP or essential-matrix inliers
+    // Matches between image a (left) and image b (right) for the GUI.
+    cv::Mat img_a, img_b;
+    std::vector<cv::KeyPoint> kp_a, kp_b;
+    std::vector<cv::DMatch> matches;
 };
 
 // ------------------------------------------------------------- calibration --
@@ -170,16 +193,19 @@ cv::FileStorage openYaml(const std::string& path) {
                                         cv::FileStorage::FORMAT_YAML);
 }
 
-StereoCalibration loadCalibration(const std::string& calibration_file,
-                                  const std::string& rig_file, double scale) {
+// With an empty `rig_file` (mono), only cam0 is loaded.
+Calibration loadCalibration(const std::string& calibration_file, const std::string& rig_file,
+                            double scale) {
     cv::FileStorage calib = openYaml(calibration_file);
-    cv::FileStorage rig = openYaml(rig_file);
-
-    StereoCalibration c;
+    Calibration c;
     c.K0 = readIntrinsics(calib["cam0"], scale);
+    c.P0 = c.K0 * cv::Matx34d::eye();
+    if (rig_file.empty()) return c;
+
     c.K1 = readIntrinsics(calib["cam1"], scale);
 
     // Rig file stores the pose of cam1 in the cam0 frame (T_cam0_cam1).
+    cv::FileStorage rig = openYaml(rig_file);
     std::vector<double> q, t;
     rig["cam1"]["rotation"] >> q;     // x, y, z, w
     rig["cam1"]["translation"] >> t;
@@ -190,7 +216,6 @@ StereoCalibration loadCalibration(const std::string& calibration_file,
     const cv::Matx33d R_1_0 = R_0_1.t();
     const cv::Vec3d t_1_0 = -(R_1_0 * t_0_1);
 
-    c.P0 = c.K0 * cv::Matx34d::eye();
     cv::Matx34d Rt1;
     for (int r = 0; r < 3; ++r) {
         for (int col = 0; col < 3; ++col) Rt1(r, col) = R_1_0(r, col);
@@ -202,9 +227,27 @@ StereoCalibration loadCalibration(const std::string& calibration_file,
     return c;
 }
 
+// ------------------------------------------------------------------ poses --
+// 4x4 transform from a rotation and a translation.
+cv::Matx44d makeTransform(const cv::Mat& R, const cv::Mat& t) {
+    cv::Matx44d T = cv::Matx44d::eye();
+    for (int r = 0; r < 3; ++r) {
+        for (int col = 0; col < 3; ++col) T(r, col) = R.at<double>(r, col);
+        T(r, 3) = t.at<double>(r);
+    }
+    return T;
+}
+
+// Camera centre in the world frame, from p_cam = T_cam_world * p_world.
+cv::Vec3d cameraCenter(const cv::Matx44d& T_cam_world) {
+    const cv::Matx44d T = T_cam_world.inv();
+    return {T(0, 3), T(1, 3), T(2, 3)};
+}
+
 // ---------------------------------------------------------------- features --
 std::vector<std::string> listImages(const fs::path& folder) {
     std::vector<std::string> names;
+    if (!fs::is_directory(folder)) return names;
     for (const auto& entry : fs::directory_iterator(folder)) {
         std::string ext = entry.path().extension().string();
         std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
@@ -244,50 +287,61 @@ void processImage(const fs::path& path, double scale, cv::ORB& orb, Timings& tim
     orb.detectAndCompute(img, cv::noArray(), kp, desc);
 }
 
-// With `parallel`, cam1 is processed on a second thread while this thread
-// processes cam0. Each thread uses its own ORB detector (one detector is not
-// thread-safe). Without it, the two images are processed one after the other.
-bool loadFrame(const fs::path& dataset, const std::string& name, double scale, bool parallel,
-               cv::ORB& orb0, cv::ORB& orb1, Timings& timings, Frame& f) {
-    ScopedTimer t(timings, "load + ORB (both cameras)");
+// In mono mode only cam0 is loaded. Otherwise, with `parallel`, cam1 is
+// processed on a second thread while this thread processes cam0. Each thread
+// uses its own ORB detector (one detector is not thread-safe). Without it, the
+// two images are processed one after the other.
+bool loadFrame(const fs::path& dataset, const std::string& name, double scale, bool mono,
+               bool parallel, cv::ORB& orb0, cv::ORB& orb1, Timings& timings, Frame& f) {
+    ScopedTimer t(timings, "load + ORB (all cameras)");
     f.name = name;
+    auto processCam0 = [&] {
+        processImage(dataset / "cam0" / name, scale, orb0, timings, f.img0, f.kp0, f.desc0);
+    };
     auto processCam1 = [&] {
         processImage(dataset / "cam1" / name, scale, orb1, timings, f.img1, f.kp1, f.desc1);
     };
+    if (mono) {
+        processCam0();
+        return !f.img0.empty();
+    }
     if (parallel) {
         auto cam1 = std::async(std::launch::async, processCam1);
-        processImage(dataset / "cam0" / name, scale, orb0, timings, f.img0, f.kp0, f.desc0);
+        processCam0();
         cam1.get();  // wait for cam1 (also re-throws any error from that thread)
     } else {
-        processImage(dataset / "cam0" / name, scale, orb0, timings, f.img0, f.kp0, f.desc0);
+        processCam0();
         processCam1();
     }
     return !f.img0.empty() && !f.img1.empty();
 }
 
 // ------------------------------------------------------------ triangulation --
-double reprojectionError(const cv::Matx34d& P, const cv::Vec4d& X, const cv::Point2f& uv) {
+double reprojectionError(const cv::Matx34d& P, const cv::Vec4d& X, const cv::Point2d& uv) {
     const cv::Vec3d x = P * X;
     return std::hypot(x[0] / x[2] - uv.x, x[1] / x[2] - uv.y);
 }
 
-StereoPoints triangulateStereo(const Frame& f, const StereoCalibration& c, Timings& timings) {
-    StereoPoints out;
-    std::vector<cv::DMatch> matches;
-    {
-        ScopedTimer t(timings, "stereo matching");
-        matches = matchDescriptors(f.desc0, f.desc1);
-    }
-    if (matches.empty()) return out;
+// Triangulates matches (query = view a, train = view b) seen by the projection
+// matrices Pa and Pb (expressed in the same frame). Keeps the points in front of
+// both views, with depth in view a within [min_depth, max_depth], and consistent
+// with both observations. `kept` receives the matches of the points returned.
+std::vector<cv::Point3d> triangulateMatches(const cv::Matx34d& Pa, const cv::Matx34d& Pb,
+                                            const std::vector<cv::KeyPoint>& kp_a,
+                                            const std::vector<cv::KeyPoint>& kp_b,
+                                            const std::vector<cv::DMatch>& matches,
+                                            double min_depth, double max_depth,
+                                            std::vector<cv::DMatch>& kept) {
+    std::vector<cv::Point3d> points;
+    if (matches.empty()) return points;
 
-    ScopedTimer t(timings, "triangulation + filtering");
-    std::vector<cv::Point2d> uv0, uv1;
+    std::vector<cv::Point2d> uv_a, uv_b;
     for (const auto& m : matches) {
-        uv0.push_back(f.kp0[m.queryIdx].pt);
-        uv1.push_back(f.kp1[m.trainIdx].pt);
+        uv_a.push_back(kp_a[m.queryIdx].pt);
+        uv_b.push_back(kp_b[m.trainIdx].pt);
     }
     cv::Mat X4;
-    cv::triangulatePoints(cv::Mat(c.P0), cv::Mat(c.P1), uv0, uv1, X4);
+    cv::triangulatePoints(cv::Mat(Pa), cv::Mat(Pb), uv_a, uv_b, X4);
     X4.convertTo(X4, CV_64F);
 
     for (size_t i = 0; i < matches.size(); ++i) {
@@ -296,18 +350,52 @@ StereoPoints triangulateStereo(const Frame& f, const StereoCalibration& c, Timin
         const cv::Vec4d X(X4.at<double>(0, i) / w, X4.at<double>(1, i) / w,
                           X4.at<double>(2, i) / w, 1.0);
 
-        // Keep points in front of both cameras, within the depth range,
-        // and consistent with both observations.
-        const double depth0 = X[2];
-        const double depth1 = (c.P1 * X)[2];  // positive scale of cam1 depth
-        if (depth0 < kMinDepth || depth0 > kMaxDepth || depth1 <= 0) continue;
-        if (reprojectionError(c.P0, X, f.kp0[matches[i].queryIdx].pt) > kMaxReprojErrorPx) continue;
-        if (reprojectionError(c.P1, X, f.kp1[matches[i].trainIdx].pt) > kMaxReprojErrorPx) continue;
+        // P = K [R | t] and the last row of K is [0 0 1], so (P X)_z is the depth.
+        const double depth_a = (Pa * X)[2];
+        const double depth_b = (Pb * X)[2];
+        if (depth_a < min_depth || depth_a > max_depth || depth_b <= 0) continue;
+        if (reprojectionError(Pa, X, uv_a[i]) > kMaxReprojErrorPx) continue;
+        if (reprojectionError(Pb, X, uv_b[i]) > kMaxReprojErrorPx) continue;
 
-        out.points.emplace_back(X[0], X[1], X[2]);
-        out.desc0.push_back(f.desc0.row(matches[i].queryIdx));
-        out.matches.push_back(matches[i]);
+        points.emplace_back(X[0], X[1], X[2]);
+        kept.push_back(matches[i]);
     }
+    return points;
+}
+
+// Stereo: cam0 and cam1 of one epoch -> points in the cam0 frame.
+TriangulatedPoints triangulateStereo(const Frame& f, const Calibration& c, Timings& timings) {
+    TriangulatedPoints out;
+    std::vector<cv::DMatch> matches;
+    {
+        ScopedTimer t(timings, "stereo matching");
+        matches = matchDescriptors(f.desc0, f.desc1);
+    }
+    ScopedTimer t(timings, "triangulation + filtering");
+    out.points = triangulateMatches(c.P0, c.P1, f.kp0, f.kp1, matches, kMinDepth, kMaxDepth,
+                                    out.matches);
+    for (const auto& m : out.matches) out.desc.push_back(f.desc0.row(m.queryIdx));
+    return out;
+}
+
+// Mono: cam0 at two epochs with known poses (p_cam = T_cam_world * p_world)
+// -> points in the world frame. Descriptors are taken from view b (the newer).
+TriangulatedPoints triangulateTwoViews(const Frame& a, const cv::Matx44d& T_a_world,
+                                       const Frame& b, const cv::Matx44d& T_b_world,
+                                       const cv::Matx33d& K, Timings& timings) {
+    TriangulatedPoints out;
+    std::vector<cv::DMatch> matches;
+    {
+        ScopedTimer t(timings, "two-view matching (mono)");
+        matches = matchDescriptors(a.desc0, b.desc0);
+    }
+    ScopedTimer t(timings, "triangulation + filtering");
+    const cv::Matx34d Pa = K * T_a_world.get_minor<3, 4>(0, 0);
+    const cv::Matx34d Pb = K * T_b_world.get_minor<3, 4>(0, 0);
+    // No metric depth range in mono: the scale is arbitrary.
+    out.points = triangulateMatches(Pa, Pb, a.kp0, b.kp0, matches, 0.0,
+                                    std::numeric_limits<double>::infinity(), out.matches);
+    for (const auto& m : out.matches) out.desc.push_back(b.desc0.row(m.trainIdx));
     return out;
 }
 
@@ -324,11 +412,7 @@ bool solvePnPOpenCV(const std::vector<cv::Point3d>& object, const std::vector<cv
 
     cv::Mat R;
     cv::Rodrigues(rvec, R);
-    T = cv::Matx44d::eye();
-    for (int r = 0; r < 3; ++r) {
-        for (int col = 0; col < 3; ++col) T(r, col) = R.at<double>(r, col);
-        T(r, 3) = tvec.at<double>(r);
-    }
+    T = makeTransform(R, tvec);
     return true;
 }
 
@@ -369,30 +453,189 @@ bool solvePnPPoseLib(const std::vector<cv::Point3d>& object, const std::vector<c
     return true;
 }
 
-// Pose of cam0 at epoch k w.r.t. cam0 at epoch k-1 (p_k = T * p_{k-1}).
-bool estimateMotion(const StereoPoints& prev, const Frame& curr, const cv::Matx33d& K0,
-                    PnPSolver solver, Timings& timings, cv::Matx44d& T_curr_prev,
-                    int& num_inliers) {
+// Resection of cam0 of `curr` on the 3D points: p_curr = T * p_points.
+// `matches_out` (optional) receives the temporal matches (query = point index,
+// train = keypoint of cam0 in `curr`).
+bool estimateMotion(const TriangulatedPoints& points, const Frame& curr, const cv::Matx33d& K0,
+                    PnPSolver solver, Timings& timings, cv::Matx44d& T, int& num_inliers,
+                    std::vector<cv::DMatch>* matches_out = nullptr) {
     std::vector<cv::Point3d> object;
     std::vector<cv::Point2d> image;
     {
         ScopedTimer t(timings, "temporal matching");
-        const std::vector<cv::DMatch> matches = matchDescriptors(prev.desc0, curr.desc0);
+        const std::vector<cv::DMatch> matches = matchDescriptors(points.desc, curr.desc0);
         for (const auto& m : matches) {
-            object.push_back(prev.points[m.queryIdx]);
+            object.push_back(points.points[m.queryIdx]);
             image.push_back(curr.kp0[m.trainIdx].pt);
         }
+        if (matches_out) *matches_out = matches;
     }
     num_inliers = 0;
-    if (static_cast<int>(object.size()) < kMinPnPInliers) return false;
+    if (static_cast<int>(object.size()) < kMinInliers) return false;
 
     ScopedTimer t(timings, solver == PnPSolver::PoseLib ? "PnP RANSAC (poselib)"
                                                         : "PnP RANSAC (opencv)");
     const bool ok = (solver == PnPSolver::PoseLib)
-        ? solvePnPPoseLib(object, image, K0, curr.img0.size(), T_curr_prev, num_inliers)
-        : solvePnPOpenCV(object, image, K0, T_curr_prev, num_inliers);
-    return ok && num_inliers >= kMinPnPInliers;
+        ? solvePnPPoseLib(object, image, K0, curr.img0.size(), T, num_inliers)
+        : solvePnPOpenCV(object, image, K0, T, num_inliers);
+    return ok && num_inliers >= kMinInliers;
 }
+
+// Relative pose of cam0 from frame a to frame b (p_b = T_b_a * p_a) with the
+// essential matrix (5-point RANSAC). The translation has unit length.
+// `matches` receives the matches used (query = a, train = b).
+bool estimateEssential(const Frame& a, const Frame& b, const cv::Matx33d& K, Timings& timings,
+                       cv::Matx44d& T_b_a, int& num_inliers, std::vector<cv::DMatch>& matches) {
+    {
+        ScopedTimer t(timings, "temporal matching");
+        matches = matchDescriptors(a.desc0, b.desc0);
+    }
+    num_inliers = 0;
+    if (static_cast<int>(matches.size()) < kMinInliers) return false;
+
+    ScopedTimer t(timings, "essential matrix (mono init)");
+    std::vector<cv::Point2d> uv_a, uv_b;
+    for (const auto& m : matches) {
+        uv_a.push_back(a.kp0[m.queryIdx].pt);
+        uv_b.push_back(b.kp0[m.trainIdx].pt);
+    }
+    cv::Mat mask;
+    const cv::Mat E = cv::findEssentialMat(uv_a, uv_b, cv::Mat(K), cv::RANSAC, 0.999,
+                                           kMaxReprojErrorPx, mask);
+    if (E.rows < 3) return false;  // can hold several 3x3 solutions: use the first
+
+    cv::Mat R, tvec;
+    num_inliers = cv::recoverPose(E.rowRange(0, 3), uv_a, uv_b, cv::Mat(K), R, tvec, mask);
+    if (num_inliers < kMinInliers) return false;
+    T_b_a = makeTransform(R, tvec);
+    return true;
+}
+
+// --------------------------------------------------------------- odometry --
+// Stereo: triangulate cam0 + cam1 at k-1, resection of cam0 at k.
+class StereoOdometry {
+public:
+    StereoOdometry(const Calibration& calib, PnPSolver solver, Timings& timings)
+        : calib_(calib), solver_(solver), timings_(timings) {}
+
+    StepResult process(const Frame& f) {
+        StepResult r;
+        if (prev_points_) {
+            cv::Matx44d T_curr_prev;
+            if (estimateMotion(*prev_points_, f, calib_.K0, solver_, timings_, T_curr_prev,
+                               r.num_inliers)) {
+                T_world_cam_ = T_world_cam_ * T_curr_prev.inv();
+                r.pose_updated = true;
+                r.status = "ok";
+            } else {
+                r.status = "PnP failed, pose kept";
+            }
+        }
+
+        // Triangulate this epoch for the next one.
+        prev_points_ = triangulateStereo(f, calib_, timings_);
+
+        r.T_world_cam = T_world_cam_;
+        r.num_points = prev_points_->points.size();
+        r.img_a = f.img0; r.kp_a = f.kp0;
+        r.img_b = f.img1; r.kp_b = f.kp1;
+        r.matches = prev_points_->matches;
+        return r;
+    }
+
+private:
+    const Calibration& calib_;
+    PnPSolver solver_;
+    Timings& timings_;
+    cv::Matx44d T_world_cam_ = cv::Matx44d::eye();  // world = cam0 at the first epoch
+    std::optional<TriangulatedPoints> prev_points_;
+};
+
+// Mono: triangulate cam0 at n-2 and n-1, resection of cam0 at n.
+class MonoOdometry {
+public:
+    MonoOdometry(const cv::Matx33d& K, PnPSolver solver, Timings& timings)
+        : K_(K), solver_(solver), timings_(timings) {}
+
+    StepResult process(const Frame& f) {
+        StepResult r;
+        cv::Matx44d T_cam_world = cv::Matx44d::eye();  // world = cam0 at the first epoch
+        r.img_a = f.img0; r.kp_a = f.kp0;
+
+        if (prev1_) {
+            T_cam_world = prev1_->T_cam_world;  // kept if everything below fails
+            r.img_a = prev1_->frame.img0;
+            r.kp_a = prev1_->frame.kp0;
+
+            const bool ok = (prev2_ && resection(f, T_cam_world, r)) ||
+                            initialise(f, T_cam_world, r);
+            if (ok) {
+                // Remember the step length to scale a later re-initialisation.
+                const double step = cv::norm(cameraCenter(T_cam_world) -
+                                             cameraCenter(prev1_->T_cam_world));
+                if (step > 0) step_length_ = step;
+                r.pose_updated = true;
+            } else {
+                r.status = "lost, pose kept";
+            }
+        }
+
+        r.T_world_cam = T_cam_world.inv();
+        r.img_b = f.img0; r.kp_b = f.kp0;
+
+        // Shift the history: n-1 -> n-2, n -> n-1.
+        prev2_ = std::move(prev1_);
+        prev1_ = View{f, T_cam_world};
+        return r;
+    }
+
+private:
+    struct View {
+        Frame frame;
+        cv::Matx44d T_cam_world;  // p_cam = T_cam_world * p_world
+    };
+
+    // Triangulate n-2 and n-1, then resection of n on those world points.
+    bool resection(const Frame& f, cv::Matx44d& T_cam_world, StepResult& r) {
+        const TriangulatedPoints points = triangulateTwoViews(
+            prev2_->frame, prev2_->T_cam_world, prev1_->frame, prev1_->T_cam_world, K_, timings_);
+        r.num_points = points.points.size();
+
+        cv::Matx44d T;
+        std::vector<cv::DMatch> temporal;
+        if (!estimateMotion(points, f, K_, solver_, timings_, T, r.num_inliers, &temporal)) {
+            return false;
+        }
+        T_cam_world = T;
+        r.status = "ok";
+        // For drawing: keypoint of the point in n-1 -> keypoint in n.
+        r.matches.clear();
+        for (const auto& m : temporal) {
+            r.matches.emplace_back(points.matches[m.queryIdx].trainIdx, m.trainIdx, m.distance);
+        }
+        return true;
+    }
+
+    // Relative pose n-1 -> n from the essential matrix, translation scaled by
+    // the last known step length (1 at start-up).
+    bool initialise(const Frame& f, cv::Matx44d& T_cam_world, StepResult& r) {
+        cv::Matx44d T_curr_prev;
+        if (!estimateEssential(prev1_->frame, f, K_, timings_, T_curr_prev, r.num_inliers,
+                               r.matches)) {
+            return false;
+        }
+        for (int i = 0; i < 3; ++i) T_curr_prev(i, 3) *= step_length_;
+        T_cam_world = T_curr_prev * prev1_->T_cam_world;
+        r.status = prev2_ ? "re-initialised (essential matrix)" : "initialised (essential matrix)";
+        return true;
+    }
+
+    cv::Matx33d K_;
+    PnPSolver solver_;
+    Timings& timings_;
+    std::optional<View> prev1_, prev2_;  // epochs n-1 and n-2
+    double step_length_ = 1.0;           // sets the (arbitrary) scale of the trajectory
+};
 
 // ------------------------------------------------------------ visualization --
 // Top view (x right, z forward) of the cam0 positions, auto-scaled to fit.
@@ -417,7 +660,7 @@ cv::Mat drawTrajectory(const std::vector<cv::Point2d>& xz, double fps, int size 
         cv::line(canvas, toPixel(xz[i - 1]), toPixel(xz[i]), {0, 200, 0}, 2);
     }
     cv::circle(canvas, toPixel(xz.back()), 5, {0, 0, 255}, -1);
-    cv::putText(canvas, "top view (x, z)  span " + cv::format("%.1f m", span),
+    cv::putText(canvas, "top view (x, z)  span " + cv::format("%.1f", span),
                 {10, 25}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {255, 255, 255}, 1);
     cv::putText(canvas, cv::format("%.1f FPS", fps),
                 {10, 50}, cv::FONT_HERSHEY_SIMPLEX, 0.6, {0, 255, 255}, 1);
@@ -444,23 +687,42 @@ int main(int argc, char** argv) {
         else if (arg == "--pnp" && i + 1 < argc) pnp = argv[++i];
         else args.push_back(arg);
     }
-    if (args.size() < 3 || scale <= 0.0 || (pnp != "opencv" && pnp != "poselib")) {
-        std::cerr << "Usage: " << argv[0]
-                  << " <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml>"
-                     " [delay_ms] [--no-gui] [--scale S] [--sequential | --single-core]"
-                     " [--pnp opencv|poselib] [--report]\n";
+    const std::string usage =
+        std::string("Usage: ") + argv[0] +
+        " <dataset_dir> <camera_calibration.yaml> [camera_rig.yaml] [delay_ms]"
+        " [--no-gui] [--scale S] [--sequential | --single-core]"
+        " [--pnp opencv|poselib] [--report]\n";
+    if (args.size() < 2 || scale <= 0.0 || (pnp != "opencv" && pnp != "poselib")) {
+        std::cerr << usage;
         return 1;
     }
+
+    // Remaining positional arguments: the rig file (.yaml / .yml) and delay_ms.
+    std::string rig_file;
+    int delay_ms = 0;  // 0 = no wait
+    for (size_t i = 2; i < args.size(); ++i) {
+        const std::string ext = fs::path(args[i]).extension().string();
+        if (ext == ".yaml" || ext == ".yml") rig_file = args[i];
+        else delay_ms = std::stoi(args[i]);
+    }
+
+    // Mono when there are no cam1 images.
+    const fs::path dataset = args[0];
+    const bool mono = listImages(dataset / "cam1").empty();
+    if (!mono && rig_file.empty()) {
+        std::cerr << "cam1/ found (stereo): camera_rig.yaml is required.\n" << usage;
+        return 1;
+    }
+
     const PnPSolver solver = (pnp == "poselib") ? PnPSolver::PoseLib : PnPSolver::OpenCV;
     if (!opencv_threads) cv::setNumThreads(1);
 
-    const fs::path dataset = args[0];
-    const StereoCalibration calib = loadCalibration(args[1], args[2], scale);
-    const std::string mode = parallel_cameras ? "parallel"
-                             : opencv_threads ? "sequential"
-                                              : "single-core";
+    const Calibration calib = loadCalibration(args[1], mono ? "" : rig_file, scale);
+    const std::string mode = mono ? "mono (cam0 only, arbitrary scale)"
+                             : parallel_cameras ? "stereo, parallel"
+                             : opencv_threads ? "stereo, sequential"
+                                              : "stereo, single-core";
     std::cout << "Image scale: " << scale << ", mode: " << mode << ", PnP: " << pnp << "\n";
-    const int delay_ms = (args.size() > 3) ? std::stoi(args[3]) : 0;  // 0 = no wait
 
     const std::vector<std::string> names = listImages(dataset / "cam0");
     if (names.empty()) {
@@ -471,64 +733,50 @@ int main(int argc, char** argv) {
     // One ORB detector per camera, so both can run in parallel.
     cv::Ptr<cv::ORB> orb0 = cv::ORB::create(kNumFeatures);
     cv::Ptr<cv::ORB> orb1 = cv::ORB::create(kNumFeatures);
+    const std::string matches_window = mono ? "temporal matches (cam0 n-1 | cam0 n)"
+                                            : "stereo matches (cam0 | cam1)";
     if (gui) {
-        cv::namedWindow("stereo matches (cam0 | cam1)", cv::WINDOW_NORMAL);
+        cv::namedWindow(matches_window, cv::WINDOW_NORMAL);
         cv::namedWindow("trajectory", cv::WINDOW_AUTOSIZE);
     }
 
-    cv::Matx44d T_world_cam = cv::Matx44d::eye();  // world = cam0 at the first epoch
+    Timings timings;
+    timings.declare({"frame total", "load + ORB (all cameras)", "image load + resize (per img)",
+                     "ORB extraction (per img)", "temporal matching", "PnP RANSAC (opencv)",
+                     "PnP RANSAC (poselib)", "essential matrix (mono init)", "stereo matching",
+                     "two-view matching (mono)", "triangulation + filtering", "visualization"});
+
+    StereoOdometry stereo_vo(calib, solver, timings);
+    MonoOdometry mono_vo(calib.K0, solver, timings);
+
     std::vector<cv::Point2d> trajectory{{0.0, 0.0}};
-    StereoPoints prev_points;
-    bool has_prev = false;
     bool paused = false;
     double fps = 0.0;  // smoothed processing rate (excludes the waitKey delay)
-
-    Timings timings;
-    timings.declare({"frame total", "load + ORB (both cameras)", "image load + resize (per img)",
-                     "ORB extraction (per img)", "temporal matching", "PnP RANSAC (opencv)",
-                     "PnP RANSAC (poselib)", "stereo matching", "triangulation + filtering",
-                     "visualization"});
 
     for (const auto& name : names) {
         cv::TickMeter timer;
         timer.start();
 
         Frame frame;
-        if (!loadFrame(dataset, name, scale, parallel_cameras, *orb0, *orb1, timings, frame)) {
-            std::cerr << "Skipping " << name << " (missing cam0 or cam1 image)\n";
+        if (!loadFrame(dataset, name, scale, mono, parallel_cameras, *orb0, *orb1, timings,
+                       frame)) {
+            std::cerr << "Skipping " << name << " (image missing or unreadable)\n";
             continue;
         }
 
-        // Resection of cam0 at this epoch on the points of the previous epoch.
-        int inliers = 0;
-        std::string status = "first frame";
-        if (has_prev) {
-            cv::Matx44d T_curr_prev;
-            if (estimateMotion(prev_points, frame, calib.K0, solver, timings, T_curr_prev,
-                               inliers)) {
-                T_world_cam = T_world_cam * T_curr_prev.inv();
-                trajectory.emplace_back(T_world_cam(0, 3), T_world_cam(2, 3));
-                status = "ok";
-            } else {
-                status = "PnP failed, pose kept";
-            }
-        }
+        const StepResult r = mono ? mono_vo.process(frame) : stereo_vo.process(frame);
+        if (r.pose_updated) trajectory.emplace_back(r.T_world_cam(0, 3), r.T_world_cam(2, 3));
 
-        // Triangulate this epoch for the next one.
-        prev_points = triangulateStereo(frame, calib, timings);
-        has_prev = true;
-
-        // Draw the stereo matches (GUI only).
+        // Draw the matches (GUI only).
         if (gui) {
             ScopedTimer t(timings, "visualization");
             cv::Mat canvas;
-            cv::drawMatches(frame.img0, frame.kp0, frame.img1, frame.kp1,
-                            prev_points.matches, canvas);
+            cv::drawMatches(r.img_a, r.kp_a, r.img_b, r.kp_b, r.matches, canvas);
             cv::putText(canvas,
-                        name + "  stereo pts: " + std::to_string(prev_points.points.size()) +
-                            "  PnP inliers: " + std::to_string(inliers) + "  " + status,
+                        name + "  3D pts: " + std::to_string(r.num_points) +
+                            "  inliers: " + std::to_string(r.num_inliers) + "  " + r.status,
                         {30, 60}, cv::FONT_HERSHEY_SIMPLEX, 1.5, {0, 255, 255}, 3);
-            cv::imshow("stereo matches (cam0 | cam1)", canvas);
+            cv::imshow(matches_window, canvas);
         }
 
         // Processing time of this frame, smoothed over the last frames.
@@ -537,11 +785,10 @@ int main(int argc, char** argv) {
         const double frame_fps = 1.0 / timer.getTimeSec();
         fps = (fps == 0.0) ? frame_fps : 0.9 * fps + 0.1 * frame_fps;
 
-        const cv::Vec3d pos(T_world_cam(0, 3), T_world_cam(1, 3), T_world_cam(2, 3));
-        std::cout << name << ": " << prev_points.points.size() << " stereo points, "
-                  << inliers << " PnP inliers, position [" << pos[0] << ", " << pos[1]
-                  << ", " << pos[2] << "] (" << status << "), "
-                  << cv::format("%.1f FPS", fps) << "\n";
+        const cv::Matx44d& T = r.T_world_cam;
+        std::cout << name << ": " << r.num_points << " triangulated points, " << r.num_inliers
+                  << " inliers, position [" << T(0, 3) << ", " << T(1, 3) << ", " << T(2, 3)
+                  << "] (" << r.status << "), " << cv::format("%.1f FPS", fps) << "\n";
 
         if (!gui) continue;
 
