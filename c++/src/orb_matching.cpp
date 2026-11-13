@@ -9,13 +9,14 @@
 //
 // Usage:
 //   ./orb_matching <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml> [delay_ms]
-//                  [--no-gui] [--scale S] [--single-core]
+//                  [--no-gui] [--scale S] [--sequential | --single-core]
 //
 //   delay_ms      wait between frames in the GUI (default 0 = no wait)
 //   --no-gui      no windows, only terminal output (can be placed anywhere)
 //   --scale S     resize images by S before ORB, e.g. 0.5 = half size (default 1)
-//   --single-core run everything on one core: cam0 and cam1 one after the other
-//                 and no OpenCV internal threads (default: multi-core)
+//   --sequential  cam0 and cam1 one after the other, OpenCV internal threads on
+//   --single-core cam0 and cam1 one after the other, OpenCV internal threads off
+//   (default: cam0 and cam1 in parallel, OpenCV internal threads on)
 //   dataset_dir   folder with cam0/ and cam1/ images with matching filenames
 //   calibration   per-camera PINHOLE intrinsics: params = [fx, fy, cx, cy]
 //   rig           ROS-style pose of each camera in the rig (cam0 = identity):
@@ -297,29 +298,32 @@ cv::Mat drawTrajectory(const std::vector<cv::Point2d>& xz, double fps, int size 
 int main(int argc, char** argv) {
     // Split the options from the positional arguments.
     bool gui = true;
-    bool multi_core = true;
+    bool parallel_cameras = true;  // cam0 and cam1 on two threads
+    bool opencv_threads = true;    // OpenCV's own internal multi-threading
     double scale = 1.0;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--no-gui") gui = false;
-        else if (arg == "--single-core") multi_core = false;
+        else if (arg == "--sequential") parallel_cameras = false;
+        else if (arg == "--single-core") parallel_cameras = opencv_threads = false;
         else if (arg == "--scale" && i + 1 < argc) scale = std::stod(argv[++i]);
         else args.push_back(arg);
     }
     if (args.size() < 3 || scale <= 0.0) {
         std::cerr << "Usage: " << argv[0]
                   << " <dataset_dir> <camera_calibration.yaml> <camera_rig.yaml>"
-                     " [delay_ms] [--no-gui] [--scale S] [--single-core]\n";
+                     " [delay_ms] [--no-gui] [--scale S] [--sequential | --single-core]\n";
         return 1;
     }
-    // Single core: also stop OpenCV from using its own internal threads.
-    if (!multi_core) cv::setNumThreads(1);
+    if (!opencv_threads) cv::setNumThreads(1);
 
     const fs::path dataset = args[0];
     const StereoCalibration calib = loadCalibration(args[1], args[2], scale);
-    std::cout << "Image scale: " << scale << ", "
-              << (multi_core ? "multi-core" : "single-core") << "\n";
+    const std::string mode = parallel_cameras ? "parallel"
+                             : opencv_threads ? "sequential"
+                                              : "single-core";
+    std::cout << "Image scale: " << scale << ", mode: " << mode << "\n";
     const int delay_ms = (args.size() > 3) ? std::stoi(args[3]) : 0;  // 0 = no wait
 
     const std::vector<std::string> names = listImages(dataset / "cam0");
@@ -348,7 +352,7 @@ int main(int argc, char** argv) {
         timer.start();
 
         Frame frame;
-        if (!loadFrame(dataset, name, scale, multi_core, *orb0, *orb1, frame)) {
+        if (!loadFrame(dataset, name, scale, parallel_cameras, *orb0, *orb1, frame)) {
             std::cerr << "Skipping " << name << " (missing cam0 or cam1 image)\n";
             continue;
         }
