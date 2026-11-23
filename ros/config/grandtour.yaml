@@ -1,0 +1,96 @@
+colmap_odometry_node:
+  ros__parameters:
+    use_sim_time: false
+    config_file: "grandtour_odometry.yaml"
+    camera_file: "grandtour_camera_calibration.yaml"
+    rig_file: "grandtour_camera_rig.yaml"
+    work_dir: "/home/p/data/grandtour/colmap_work"
+    # Topics present in data/grandtour/alb2 (rosbag-convert output).
+    # COLMAP subscribes to CompressedImage directly.
+    image_topics: [
+      "/boxi/alphasense/front_left/image_raw/compressed",
+      "/boxi/alphasense/front_right/image_raw/compressed",
+    ]
+    camera_names: ["cam0", "cam1"]
+    world_frame_id: "world"
+    # The metadata has T_base_box_base = Rx(pi): box_base is FRD/upside-down
+    # relative to the robot's upright base.  Publish the common upright body.
+    body_frame_id: "base"
+    camera_frame_ids: ["alphasense_front_left", "alphasense_front_right"]
+    publish_tf: true
+    # The source TF tree already owns these native camera-frame transforms.
+    publish_camera_tf: false
+
+    # T_camera_base = T_alphasense_front_left_base, from the bag's /tf_static
+    # chain (base -> box_base -> alphasense_base -> front_left).  It converts
+    # the COLMAP rig pose (front-left camera) into the upright robot base.
+    T_camera_base: [
+      -0.000797703823, -0.999833500833, -0.018230037844,  0.069163886175,
+      -0.171929415331,  0.018095710837, -0.984943054899,  0.284804064148,
+       0.985108948194,  0.002348586908, -0.171915224244, -0.402944890382,
+       0.0, 0.0, 0.0, 1.0]
+
+    imu:
+      enabled: true
+      topic: /boxi/alphasense/imu
+      time_offset_sec: 0.0
+      # T_base_imu from /tf_static. Both rotation and translation are used:
+      # samples are converted to the upright base origin before propagation.
+      T_base_imu: [
+         0.997175073075, -0.015298117287,  0.073538025841,  0.384911270198,
+        -0.016350537681, -0.999772039761,  0.013730565535,  0.021897273720,
+         0.073311210293, -0.014894163953, -0.997197889250,  0.219484356504,
+         0.0, 0.0, 0.0, 1.0]
+      queue_depth: 2000
+      sample_buffer_size: 0
+      wait_timeout_sec: 0.05
+      initialization_duration_sec: 0.5
+      initialization_max_wait_sec: 1.0
+      initialization_max_gyro_norm: 0.03
+      initialization_max_gyro_std: 0.015
+      initialization_max_accel_std: 0.15
+      gravity_magnitude: 9.80665
+      align_world_with_gravity: false
+      accel_noise_variance: 2.5e-05
+      gyro_noise_variance: 2.5e-07
+      accel_bias_random_walk_variance: 1.0e-06
+      gyro_bias_random_walk_variance: 2.5e-09
+      gravity_random_walk_variance: 0.0
+      initial_position_std: 0.01
+      initial_velocity_std: 0.25
+      initial_orientation_std: 0.03
+      initial_gyro_bias_std: 0.01
+      initial_accel_bias_std: 0.1
+      initial_gravity_std: 0.5
+      visual_translation_std_floor: 0.005
+      visual_rotation_std_floor: 0.005
+      visual_model_translation_std: 0.0
+      visual_model_rotation_std: 0.0
+      visual_nis_soft_threshold: 16.812
+      maximum_iterations: 4
+      convergence_epsilon: 0.00001
+      maximum_propagation_step_sec: 0.01
+      maximum_gap_sec: 0.1
+      prior_maximum_reprojection_error_px: 5.0
+      prior_minimum_inliers: 10
+    sync_queue_size: 40
+    # Match the stable iRobot replay profile.
+    image_qos_reliability: reliable
+    sync_slop: 0.01
+    # Preserve the JPEG's native mono layout; LoMa accepts mono input.
+    image_encoding: passthrough
+    # Complete path snapshots retain every pose, but are not resent for every
+    # image frame (which otherwise overwhelms RViz/DDS on a long bag).
+    path_publish_period_sec: 0.5
+    publish_feature_matches: true
+    publish_sparse_point_cloud: true
+    publish_feature_tracks: true
+    feature_match_max_features: 1500
+    feature_match_max_matches: 500
+    save_trajectory_tum: true
+    trajectory_tum_path: "/home/p/data/grandtour/grandtour_colmap.tum"
+    trajectory_tum_overwrite: true
+    frame_log_path: "frames.jsonl"
+    performance_log_every_n_frames: 10
+    performance_slow_frame_sec: 1.0
+    performance_stall_warn_sec: 3.0

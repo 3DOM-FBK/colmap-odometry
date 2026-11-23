@@ -1,0 +1,103 @@
+# ROS 2 node configuration for the TUM-VI benchmark dataset (1024x1024 stereo
+# at 20 Hz plus a 200 Hz BMI160 IMU).
+#
+#   https://cvg.cit.tum.de/data/datasets/visual-inertial-dataset
+#
+# The official TUM-VI bags publish /cam0/image_raw, /cam1/image_raw and /imu0.
+# If you replay the exported EuroC/DSO data through a loader, keep the same
+# topic names or adapt image_topics below.
+#
+# Run with:
+#   ros2 launch colmap_odometry colmap_odometry.launch.py params_file:=tumvi.yaml
+colmap_odometry_node:
+  ros__parameters:
+    use_sim_time: true  # TUM-VI is bag data; set false if /clock is not published
+    config_file: "config_odometry_tumvi.yaml"
+    camera_file: "config_cameras_intrinsics_tumvi.yaml"
+    rig_file: "config_camera_rig_tumvi.yaml"
+
+    work_dir: "/tmp/colmap_odometry_tumvi"
+    image_topics: ["/cam0/image_raw", "/cam1/image_raw"]
+    camera_names: ["cam0", "cam1"]
+
+    world_frame_id: "world"
+    # TUM-VI ground truth poses are expressed in the IMU frame, so the body is
+    # imu0 and T_camera_base below maps visual cam0 poses into the IMU frame.
+    body_frame_id: "imu0"
+    camera_frame_ids: ["cam0", "cam1"]
+    publish_tf: true
+    publish_camera_tf: true
+
+    # Row-major T_camera_base: p_camera = T_camera_base * p_base.
+    # T_cam0_imu0 from the official TUM-VI kalibr calibration
+    # (pinhole-equi-1024.zip): p_cam0 = T_cam0_imu0 * p_imu0.
+    T_camera_base: [
+      -0.9995378259923383,  0.02917807204183088, -0.008530798463872679,  0.047094247958417004,
+       0.007526588843243184, -0.03435493139706542, -0.9993813532126198, -0.04788273017221637,
+      -0.029453096117288798, -0.9989836729399656,  0.034119442089241274, -0.0697294754693238,
+       0.0, 0.0, 0.0, 1.0
+    ]
+
+    imu:
+      enabled: false
+      topic: "/imu0"
+      time_offset_sec: 0.0  # cameras and IMU are hardware-synchronized
+      # p_base = T_base_imu * p_imu. base == imu0 and the calibrated TUM-VI
+      # IMU data is already scaled and axis-aligned to the body frame.
+      T_base_imu: [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0
+      ]
+      queue_depth: 2000
+      wait_timeout_sec: 0.15
+      initialization_duration_sec: 0.2
+      gravity_magnitude: 9.80665
+      align_world_with_gravity: false
+      # Continuous covariance diagonals (noise density squared), from the
+      # official TUM-VI IMU noise densities: acc 0.0028 m/s^2/sqrt(Hz),
+      # gyro 0.00016 rad/s/sqrt(Hz), acc bias 0.00086 m/s^3/sqrt(Hz),
+      # gyro bias 0.000022 rad/s^2/sqrt(Hz).
+      accel_noise_variance: 7.84e-06
+      gyro_noise_variance: 2.56e-08
+      accel_bias_random_walk_variance: 7.4e-07
+      gyro_bias_random_walk_variance: 4.84e-10
+      initial_position_std: 0.01
+      initial_velocity_std: 0.25
+      initial_orientation_std: 0.03
+      initial_gyro_bias_std: 0.01
+      initial_accel_bias_std: 0.1
+      # Floors on the per-frame visual measurement in the filter update; they
+      # match the actual frame-to-frame visual accuracy so that the update
+      # estimates the biases (NIS around its degrees of freedom).
+      visual_translation_std_floor: 0.001
+      visual_rotation_std_floor: 0.0003
+      # Gyro rotation prior floor (per frame) in the visual solve.
+      rotation_factor_std_floor: 0.0003
+      maximum_iterations: 4
+      convergence_epsilon: 0.00001
+      maximum_propagation_step_sec: 0.01
+      maximum_gap_sec: 0.1
+      prior_maximum_reprojection_error_px: 5.0
+      prior_minimum_inliers: 10
+
+    sync_queue_size: 40
+    sync_slop: 0.05
+    # rosbag2 offers these image topics as RELIABLE; retain every sample.
+    image_qos_reliability: reliable
+    image_encoding: "mono8"  # grayscale; cv_bridge converts mono16 bags as well
+
+    publish_feature_matches: true
+    publish_sparse_point_cloud: true
+    publish_feature_tracks: false
+    feature_match_max_features: 2000
+    feature_match_max_matches: 1000
+
+    save_trajectory_tum: true
+    trajectory_tum_path: "/home/p/data/colmap_room1.txt"
+    trajectory_tum_overwrite: true
+
+    performance_log_every_n_frames: 10
+    performance_slow_frame_sec: 1.0
+    performance_stall_warn_sec: 3.0

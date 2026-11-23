@@ -1,0 +1,46 @@
+colmap_odometry_node:
+  ros__parameters:
+    config_file: "colmap_config_stelvio.yaml"
+    camera_file: "colmap_calibration_stelvio.yaml"
+    rig_file: "colmap_camera_rig_stelvio.yaml"
+
+    work_dir: "/tmp/colmap_odometry_stelvio"
+
+    image_topics:
+      - "/cam0/image_raw"
+      - "/cam1/image_raw"
+    camera_names:
+      - "cam0"
+      - "cam1"
+
+    world_frame_id: "map"
+    body_frame_id: "livox"
+    camera_frame_ids:
+      - "cam0"
+      - "cam1"
+    publish_tf: true
+
+    # Row-major T_camera_base. Here base is the Stelvio LiDAR frame and
+    # cam0 is the upstream master camera: p_cam0 = T_camera_base * p_livox.
+    T_camera_base: [
+      0.005016792959722, 0.99986788737952, -0.015460946793862, 0.131840376715189,
+      -0.999855817238321, 0.00476471719275, -0.016298388658129, 0.005918073082075,
+      -0.016222573349571, 0.015540487850577, 0.999747633250366, 0.017723822163858,
+      0.0, 0.0, 0.0, 1.0
+    ]
+
+    sync_queue_size: 40
+    sync_slop: 0.05
+    image_encoding: "bgr8"
+
+    publish_feature_matches: true
+    publish_feature_tracks: true
+    feature_match_max_features: 1500
+    feature_match_max_matches: 500
+    save_trajectory_tum: false
+    trajectory_tum_path: "/home/p/data/test.tum"
+    trajectory_tum_overwrite: true
+
+    performance_log_every_n_frames: 10
+    performance_slow_frame_sec: 1.0
+    performance_stall_warn_sec: 3.0

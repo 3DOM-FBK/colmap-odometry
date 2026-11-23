@@ -1,0 +1,13 @@
+# ROS TF-style camera poses in the cam0 rig frame: T_rig_camera.
+# Quaternion order is [x, y, z, w]. The wrapper derives COLMAP's inverse
+# camera extrinsics internally; do not pre-invert these transforms.
+# Source: official TUM-VI kalibr calibration "pinhole-equi-1024" (T_cn_cnm1).
+cam0:
+  rotation: [0.0, 0.0, 0.0, 1.0]
+  translation: [0.0, 0.0, 0.0]
+
+# cam1 (right camera) in the cam0 frame. Stereo baseline ~0.10095 m.
+cam1:
+  rotation: [-0.023459743082555, 0.000340359592822, -0.000410220570705,
+             0.99972464025297]
+  translation: [0.100923781005037, 0.001946770031223, 0.001305853179541]

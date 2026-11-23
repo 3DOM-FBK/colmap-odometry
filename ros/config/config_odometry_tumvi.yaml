@@ -1,0 +1,32 @@
+# TUM-VI stereo odometry (1024x1024 fisheye at 20 Hz, ~0.101 m baseline).
+stereo_pairs: [[cam0, cam1]]
+
+features:
+  resize: {width: 1024, height: 1024}
+  joint: {name: loma, model: loma_B128, num_keypoints: 1000, filter_threshold: 0.1, compile: true}
+
+stereo:
+  epipolar_max_error_px: 2.0
+  reprojection_max_error_px: 3.0
+  min_triangulation_angle_deg: 0.2
+  min_depth: 0.2
+  max_depth: 20.0
+
+temporal:
+  max_error_px: 2.0
+  confidence: 0.999
+  max_iterations: 10000
+
+pnp:
+  ransac_max_error_px: 3.0
+
+refinement:
+  pixel_std_px: 1.0
+  robust_delta: 3.0
+  max_iterations: 4
+  min_points: 6
+  spatial_clusters: 24
+
+feature_tracks:
+  enabled: false
+  min_length: 50

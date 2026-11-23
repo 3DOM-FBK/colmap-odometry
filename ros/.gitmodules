@@ -1,0 +1,6 @@
+[submodule "colmap_odometry/thirdparty/LoMa"]
+	path = colmap_odometry/thirdparty/LoMa
+	url = https://github.com/davnords/LoMa.git
+[submodule "colmap_odometry/thirdparty/LightGlue"]
+	path = colmap_odometry/thirdparty/LightGlue
+	url = https://github.com/cvg/LightGlue.git

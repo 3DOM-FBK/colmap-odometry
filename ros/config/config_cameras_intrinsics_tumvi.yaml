@@ -1,0 +1,21 @@
+# TUM-VI dataset camera intrinsics for the calibrated 1024x1024 images.
+# Source: official TUM-VI kalibr calibration "pinhole-equi-1024":
+#   https://cvg.cit.tum.de/_media/data/datasets/visual-inertial-dataset/pinhole-equi-1024.zip
+#
+# The dataset's pinhole projection with equidistant (Kannala-Brandt)
+# distortion maps directly onto COLMAP's OPENCV_FISHEYE model:
+#   theta_d = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
+# Parameter order: fx, fy, cx, cy, k1, k2, k3, k4.
+cam0:
+  model: OPENCV_FISHEYE
+  width: 1024
+  height: 1024
+  params: [380.81042871360756, 380.81194179427075, 510.29465304840727, 514.3304630538506,
+           0.010171079892421483, -0.010816440029919381, 0.005942781769412756, -0.001662284667857643]
+
+cam1:
+  model: OPENCV_FISHEYE
+  width: 1024
+  height: 1024
+  params: [379.2869884263036, 379.26583742214524, 505.5666703237407, 510.2840961765407,
+           0.01371679169245271, -0.015567360615942622, 0.00905043103315326, -0.002347858896562788]

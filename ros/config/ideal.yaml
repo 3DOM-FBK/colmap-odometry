@@ -1,0 +1,89 @@
+colmap_odometry_node:
+  ros__parameters:
+    # Wall-clock scheduling keeps offline queues draining after bag EOF.
+    # Measurements and published poses still use recorded header timestamps.
+    use_sim_time: false
+    config_file: ideal_odometry.yaml
+    camera_file: ideal_camera_calibration.yaml
+    rig_file: ideal_camera_rig.yaml
+    work_dir: /home/p/data/ideal_results/colmap_work
+    image_topics: [/zed_node/zed/left/color/rect/image, /zed_node/zed/right/color/rect/image]
+    camera_names: [cam0, cam1]
+    camera_frame_ids: [zed_left_camera_frame_optical, zed_right_camera_frame_optical]
+    world_frame_id: world
+    body_frame_id: base_link
+    # Stelvio alone owns world -> base_link in the complete fusion run.
+    publish_tf: false
+    publish_camera_tf: false
+    # Inverse of base -> sensing_kit -> ZED mount -> left optical frame.
+    # Includes the REP-103 body-to-optical rotation, not just the mount RPY.
+    T_camera_base: [
+      -0.015419229911, -0.999868685600, -0.004985870596, 0.093566362988,
+      -0.440250542697, 0.011266139727, -0.897804284770, 2.159558197669,
+       0.897742561654, -0.011648418446, -0.440366446659, 0.542313108129,
+       0.0, 0.0, 0.0, 1.0]
+    imu:
+      enabled: true
+      topic: /imu_rion
+      time_offset_sec: 0.0
+      T_base_imu: [
+        1.0, 0.0, 0.0, 0.42,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 2.053,
+        0.0, 0.0, 0.0, 1.0]
+      queue_depth: 2000
+      sample_buffer_size: 0
+      wait_timeout_sec: 0.05
+      initialization_duration_sec: 0.5
+      initialization_max_wait_sec: 1.0
+      initialization_max_gyro_norm: 0.03
+      initialization_max_gyro_std: 0.015
+      initialization_max_accel_std: 0.15
+      gravity_magnitude: 9.80665
+      align_world_with_gravity: false
+      # Starting noise settings; the bag contains no measured noise covariance.
+      accel_noise_variance: 0.0025
+      gyro_noise_variance: 0.000005
+      accel_bias_random_walk_variance: 0.000001
+      gyro_bias_random_walk_variance: 0.00000001
+      gravity_random_walk_variance: 0.0
+      initial_position_std: 0.01
+      initial_velocity_std: 0.25
+      initial_orientation_std: 0.03
+      initial_gyro_bias_std: 0.01
+      initial_accel_bias_std: 0.1
+      initial_gravity_std: 0.5
+      visual_translation_std_floor: 0.005
+      visual_rotation_std_floor: 0.005
+      maximum_iterations: 4
+      convergence_epsilon: 0.00001
+      maximum_propagation_step_sec: 0.01
+      maximum_gap_sec: 0.1
+      prior_maximum_reprojection_error_px: 5.0
+      prior_minimum_inliers: 10
+      rotation_factor_std_floor: 0.003
+      gravity_factor_enabled: true
+      gravity_factor_std: 0.05
+      gravity_factor_window_sec: 0.05
+      gravity_factor_minimum_samples: 3
+      gravity_factor_acceleration_tolerance_mps2: 1.5
+      gravity_factor_max_gyro_norm: 1.0
+    sync_queue_size: 80
+    sync_slop: 0.01
+    image_qos_reliability: reliable
+    # Native images are BGRA8; cv_bridge converts them to the BGR model input.
+    image_encoding: bgr8
+    processing_queue_size: 0
+    path_publish_period_sec: 0.5
+    publish_feature_tracks: true
+    publish_feature_matches: true
+    publish_sparse_point_cloud: true
+    feature_match_max_features: 1500
+    feature_match_max_matches: 500
+    save_trajectory_tum: true
+    trajectory_tum_path: /home/p/data/ideal_results/colmap.tum
+    trajectory_tum_overwrite: true
+    frame_log_path: /home/p/data/ideal_results/colmap_frames.jsonl
+    performance_log_every_n_frames: 10
+    performance_slow_frame_sec: 1.0
+    performance_stall_warn_sec: 3.0

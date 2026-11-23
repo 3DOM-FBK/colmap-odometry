@@ -1,0 +1,14 @@
+# ROS convention: each entry is T_rig_camera.  The front-left camera is the
+# rig origin, as required by COLMAP's rig YAML.  The wrapper explicitly
+# inverts these transforms to COLMAP's internal T_camera_rig convention.
+#
+# Values were derived directly from the bag's /tf_static chain:
+# alphasense_front_left -> alphasense_front_right.  These are already the
+# calibrated image/projection frames; do not apply an optical-axis permutation.
+cam0:
+  rotation: [0.0, 0.0, 0.0, 1.0]
+  translation: [0.0, 0.0, 0.0]
+cam1:
+  rotation: [0.0002310601500825, 0.001735299549828,
+             -0.0102557208139700, 0.9999458763039000]
+  translation: [0.110077144144, -0.000468658258, -0.001200930919]

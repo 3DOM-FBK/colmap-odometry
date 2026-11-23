@@ -1,0 +1,14 @@
+# ROS camera poses in the cam0 rig frame (T_rig_camera). Quaternion ordering
+# is x, y, z, w. The wrapper inverts these poses for COLMAP.
+cam0:
+  rotation: [0.0, 0.0, 0.0, 1.0]
+  translation: [0.0, 0.0, 0.0]
+
+# ROS T_left_right for the recorded AVT image orientation. Its inverse gives
+# the COLMAP right_from_left extrinsic printed by the node. In particular, the
+# y component below must not be copied from the projection extrinsic: this is
+# a ROS camera pose and the wrapper performs the complete rigid inverse.
+cam1:
+  rotation: [0.001381335638, -0.006174988051, -0.002812544932,
+             0.999976025225]
+  translation: [0.399963167291, -0.002256805786, 0.004936763951]
