@@ -19,9 +19,10 @@
 // Usage:
 //   ./orb_matching <dataset_dir> <camera_calibration.yaml> [camera_rig.yaml] [delay_ms]
 //                  [--no-gui] [--scale S] [--sequential | --single-core]
-//                  [--pnp opencv|poselib] [--report]
+//                  [--pnp opencv|poselib] [--features N] [--report]
 //
-//   --report      print a timing table per processing stage at the end
+//   --features N  number of ORB features per image (default 2000)
+//   --report     print a timing table per processing stage at the end
 //   --pnp         resection solver: opencv (solvePnPRansac, default) or
 //                 poselib (P3P in LO-RANSAC + non-linear refinement)
 //   delay_ms      wait between frames in the GUI (default 0 = no wait)
@@ -60,7 +61,7 @@ namespace fs = std::filesystem;
 enum class PnPSolver { OpenCV, PoseLib };
 
 // ---------------------------------------------------------------- settings --
-constexpr int kNumFeatures = 2000;
+constexpr int kDefaultNumFeatures = 2000; // ORB features per image (--features)
 constexpr float kRatioTest = 0.8f;        // Lowe's ratio test
 constexpr double kMaxReprojErrorPx = 2.0; // triangulation, PnP and essential matrix threshold
 constexpr double kMinDepth = 0.5;         // metres (stereo only)
@@ -675,6 +676,7 @@ int main(int argc, char** argv) {
     bool opencv_threads = true;    // OpenCV's own internal multi-threading
     double scale = 1.0;
     std::string pnp = "opencv";
+    int num_features = kDefaultNumFeatures;
     bool report = false;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
@@ -685,14 +687,16 @@ int main(int argc, char** argv) {
         else if (arg == "--single-core") parallel_cameras = opencv_threads = false;
         else if (arg == "--scale" && i + 1 < argc) scale = std::stod(argv[++i]);
         else if (arg == "--pnp" && i + 1 < argc) pnp = argv[++i];
+        else if (arg == "--features" && i + 1 < argc) num_features = std::stoi(argv[++i]);
         else args.push_back(arg);
     }
     const std::string usage =
         std::string("Usage: ") + argv[0] +
         " <dataset_dir> <camera_calibration.yaml> [camera_rig.yaml] [delay_ms]"
         " [--no-gui] [--scale S] [--sequential | --single-core]"
-        " [--pnp opencv|poselib] [--report]\n";
-    if (args.size() < 2 || scale <= 0.0 || (pnp != "opencv" && pnp != "poselib")) {
+        " [--pnp opencv|poselib] [--features N] [--report]\n";
+    if (args.size() < 2 || scale <= 0.0 || num_features <= 0 ||
+        (pnp != "opencv" && pnp != "poselib")) {
         std::cerr << usage;
         return 1;
     }
@@ -722,7 +726,8 @@ int main(int argc, char** argv) {
                              : parallel_cameras ? "stereo, parallel"
                              : opencv_threads ? "stereo, sequential"
                                               : "stereo, single-core";
-    std::cout << "Image scale: " << scale << ", mode: " << mode << ", PnP: " << pnp << "\n";
+    std::cout << "Image scale: " << scale << ", mode: " << mode << ", PnP: " << pnp
+              << ", ORB features: " << num_features << "\n";
 
     const std::vector<std::string> names = listImages(dataset / "cam0");
     if (names.empty()) {
@@ -731,8 +736,8 @@ int main(int argc, char** argv) {
     }
 
     // One ORB detector per camera, so both can run in parallel.
-    cv::Ptr<cv::ORB> orb0 = cv::ORB::create(kNumFeatures);
-    cv::Ptr<cv::ORB> orb1 = cv::ORB::create(kNumFeatures);
+    cv::Ptr<cv::ORB> orb0 = cv::ORB::create(num_features);
+    cv::Ptr<cv::ORB> orb1 = cv::ORB::create(num_features);
     const std::string matches_window = mono ? "temporal matches (cam0 n-1 | cam0 n)"
                                             : "stereo matches (cam0 | cam1)";
     if (gui) {
