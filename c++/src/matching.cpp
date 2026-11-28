@@ -17,13 +17,21 @@
 //   is set to length 1, so the trajectory is in arbitrary units.
 //
 // Usage:
-//   ./orb_matching <dataset_dir> <camera_calibration.yaml> [camera_rig.yaml] [delay_ms]
+//   ./matching <dataset_dir> <camera_calibration.yaml> [camera_rig.yaml] [delay_ms]
 //                  [--no-gui] [--scale S] [--sequential | --single-core]
-//                  [--pnp opencv|poselib] [--detector orb|sift] [--features N] [--report]
+//                  [--pnp opencv|poselib] [--detector orb|sift|aliked|xfeat] [--features N]
+//                  [--models DIR] [--feature-device cuda|cpu] [--report]
 //
-//   --detector    local features: orb (default, binary, Hamming matching) or sift
-//                 (OpenCV SIFT, float descriptors, L2 matching; slower)
+//   --detector    local features (descriptors matched with a ratio test):
+//                   orb    (default) OpenCV ORB, binary descriptors, Hamming distance
+//                   sift   OpenCV SIFT, float descriptors, L2 distance; slower
+//                   aliked ALIKED (aliked-n16), learned, ONNX Runtime; L2 distance
+//                   xfeat  XFeat, learned, ONNX Runtime; L2 distance
+//                 aliked and xfeat need a build with ONNX Runtime and the ONNX
+//                 models (models/export_models.sh)
 //   --features N  number of features per image (default 2000)
+//   --models DIR  folder with the ONNX models (default: models/ of this source tree)
+//   --feature-device  aliked / xfeat on cuda (default; CPU if no GPU) or cpu
 //   --report     print a timing table per processing stage at the end
 //   --pnp         resection solver: opencv (solvePnPRansac, default) or
 //                 poselib (P3P in LO-RANSAC + non-linear refinement)
@@ -44,27 +52,46 @@
 // Keys: q / ESC = quit, space = pause / resume, any key while paused = next frame
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <PoseLib/poselib.h>
 #include <opencv2/opencv.hpp>
 
+#ifdef COLMAP_ODOMETRY_WITH_ONNX
+#include <dlfcn.h>
+#include <onnxruntime_cxx_api.h>
+#endif
+
 namespace fs = std::filesystem;
 
 enum class PnPSolver { OpenCV, PoseLib };
-enum class FeatureType { ORB, SIFT };
+enum class FeatureType { ORB, SIFT, ALIKED, XFEAT };
+
+#ifdef COLMAP_ODOMETRY_WITH_ONNX
+#include "deep_features.h"
+#ifndef COLMAP_ODOMETRY_MODELS_DIR
+#define COLMAP_ODOMETRY_MODELS_DIR "models"
+#endif
+constexpr const char* kDefaultModelsDir = COLMAP_ODOMETRY_MODELS_DIR;
+#else
+constexpr const char* kDefaultModelsDir = "models";
+#endif
 
 // ---------------------------------------------------------------- settings --
 constexpr int kDefaultNumFeatures = 2000; // features per image (--features)
@@ -284,20 +311,48 @@ std::vector<std::string> listImages(const fs::path& folder) {
     return names;
 }
 
-// "orb" | "sift" -> FeatureType; throws on anything else.
+// "orb" | "sift" | "aliked" | "xfeat" -> FeatureType; throws on anything else,
+// and for aliked / xfeat in a build without ONNX Runtime.
 FeatureType parseFeatureType(const std::string& name) {
     if (name == "orb") return FeatureType::ORB;
     if (name == "sift") return FeatureType::SIFT;
-    throw std::runtime_error("Unknown detector '" + name + "' (orb or sift)");
+    if (name == "aliked" || name == "xfeat") {
+#ifdef COLMAP_ODOMETRY_WITH_ONNX
+        return name == "aliked" ? FeatureType::ALIKED : FeatureType::XFEAT;
+#else
+        throw std::runtime_error("--detector " + name +
+                                 " needs a build with ONNX Runtime (see CMakeLists.txt)");
+#endif
+    }
+    throw std::runtime_error("Unknown detector '" + name + "' (orb, sift, aliked or xfeat)");
 }
 
-const char* featureName(FeatureType type) { return type == FeatureType::ORB ? "ORB" : "SIFT"; }
+const char* featureName(FeatureType type) {
+    switch (type) {
+        case FeatureType::SIFT: return "SIFT";
+        case FeatureType::ALIKED: return "ALIKED";
+        case FeatureType::XFEAT: return "XFeat";
+        default: return "ORB";
+    }
+}
 
 // Detector + descriptor. Not thread-safe: create one per camera thread.
-//   ORB:  binary descriptors (CV_8U, 32 bytes), Hamming distance.
-//   SIFT: float descriptors (CV_32F, 128 values), L2 distance. Default OpenCV
-//         settings, best `num_features` keypoints by response.
-cv::Ptr<cv::Feature2D> createDetector(FeatureType type, int num_features) {
+//   ORB:    binary descriptors (CV_8U, 32 bytes), Hamming distance.
+//   SIFT:   float descriptors (CV_32F, 128 values), L2 distance. Default OpenCV
+//           settings, best `num_features` keypoints by response.
+//   ALIKED: float descriptors (128, L2-normalized), ONNX models in `models_dir`.
+//   XFeat:  float descriptors (64, L2-normalized), ONNX model in `models_dir`.
+// `device` (cuda | cpu) is used by ALIKED and XFeat only.
+cv::Ptr<cv::Feature2D> createDetector(FeatureType type, int num_features,
+                                      const std::string& models_dir = kDefaultModelsDir,
+                                      const std::string& device = "cuda") {
+#ifdef COLMAP_ODOMETRY_WITH_ONNX
+    if (type == FeatureType::ALIKED) return cv::makePtr<AlikedFeature2D>(models_dir, num_features, device);
+    if (type == FeatureType::XFEAT) return cv::makePtr<XFeatFeature2D>(models_dir, num_features, device);
+#else
+    (void)models_dir;
+    (void)device;
+#endif
     if (type == FeatureType::SIFT) return cv::SIFT::create(num_features);
     return cv::ORB::create(num_features);
 }
@@ -803,6 +858,8 @@ int main(int argc, char** argv) {
     std::string pnp = "opencv";
     int num_features = kDefaultNumFeatures;
     std::string detector = "orb";
+    std::string models_dir = kDefaultModelsDir;
+    std::string feature_device = "cuda";
     bool report = false;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
@@ -815,16 +872,26 @@ int main(int argc, char** argv) {
         else if (arg == "--pnp" && i + 1 < argc) pnp = argv[++i];
         else if (arg == "--features" && i + 1 < argc) num_features = std::stoi(argv[++i]);
         else if (arg == "--detector" && i + 1 < argc) detector = argv[++i];
+        else if (arg == "--models" && i + 1 < argc) models_dir = argv[++i];
+        else if (arg == "--feature-device" && i + 1 < argc) feature_device = argv[++i];
         else args.push_back(arg);
     }
     const std::string usage =
         std::string("Usage: ") + argv[0] +
         " <dataset_dir> <camera_calibration.yaml> [camera_rig.yaml] [delay_ms]"
         " [--no-gui] [--scale S] [--sequential | --single-core]"
-        " [--pnp opencv|poselib] [--detector orb|sift] [--features N] [--report]\n";
+        " [--pnp opencv|poselib] [--detector orb|sift|aliked|xfeat] [--features N]"
+        " [--models DIR] [--feature-device cuda|cpu] [--report]\n";
     if (args.size() < 2 || scale <= 0.0 || num_features <= 0 ||
-        (pnp != "opencv" && pnp != "poselib") || (detector != "orb" && detector != "sift")) {
+        (pnp != "opencv" && pnp != "poselib")) {
         std::cerr << usage;
+        return 1;
+    }
+    FeatureType feature_type;
+    try {
+        feature_type = parseFeatureType(detector);
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n" << usage;
         return 1;
     }
 
@@ -853,7 +920,6 @@ int main(int argc, char** argv) {
                              : parallel_cameras ? "stereo, parallel"
                              : opencv_threads ? "stereo, sequential"
                                               : "stereo, single-core";
-    const FeatureType feature_type = parseFeatureType(detector);
     std::cout << "Image scale: " << scale << ", mode: " << mode << ", PnP: " << pnp
               << ", " << featureName(feature_type) << " features: " << num_features << "\n";
 
@@ -864,8 +930,15 @@ int main(int argc, char** argv) {
     }
 
     // One detector per camera, so both can run in parallel.
-    cv::Ptr<cv::Feature2D> detector0 = createDetector(feature_type, num_features);
-    cv::Ptr<cv::Feature2D> detector1 = createDetector(feature_type, num_features);
+    cv::Ptr<cv::Feature2D> detector0, detector1;
+    try {
+        detector0 = createDetector(feature_type, num_features, models_dir, feature_device);
+        if (!mono) detector1 = createDetector(feature_type, num_features, models_dir, feature_device);
+        else detector1 = detector0;  // unused in mono
+    } catch (const std::exception& e) {
+        std::cerr << e.what() << "\n";
+        return 1;
+    }
     const std::string matches_window = mono ? "temporal matches (cam0 n-1 | cam0 n)"
                                             : "stereo matches (cam0 | cam1)";
     if (gui) {

@@ -14,7 +14,7 @@ cd path/to/pycolmap-odometry/c++
 ```
 cmake -S . -B build
 cmake --build build -j
-./build/orb_matching assets/02_set_with_trajectory/images \
+./build/matching assets/02_set_with_trajectory/images \
     calibration/camera_calibration.yaml \
     calibration/camera_rig.yaml --scale 0.5 --pnp poselib --features 2000
 ```

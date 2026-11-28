@@ -1,0 +1,33 @@
+# One-off container to export ALIKED and XFeat to ONNX (CPU only, not needed
+# at runtime: the C++ code runs the .onnx files with ONNX Runtime).
+#
+# Use export_models.sh in this folder, which builds this image and runs the
+# exports. The original PyTorch code and weights are fetched at pinned commits.
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 \
+        --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir numpy==2.1.3 scipy==1.14.1 onnx==1.17.0 onnxruntime==1.20.1
+
+RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir kornia==0.7.4 opencv-python-headless==4.10.0.84 tqdm==4.67.1
+
+# XFeat (Potje et al., CVPR 2024): code and weights (weights/xfeat.pt).
+ARG XFEAT_COMMIT=e92685f57f8318b18725c5c8c0bd28c7fe188d9a
+RUN git clone https://github.com/verlab/accelerated_features.git /opt/xfeat \
+    && git -C /opt/xfeat checkout ${XFEAT_COMMIT} \
+    && echo "0f5187fd7bedd26c7fe6acc9685444493a165a35ecc087b33c2db3627f3ea10b  /opt/xfeat/weights/xfeat.pt" \
+       | sha256sum -c -
+
+# ALIKED (Zhao et al., IEEE TIM 2023): the pure-PyTorch implementation in
+# LightGlue (lightglue/aliked.py, no compiled custom ops) and the original
+# aliked-n16 weights from the ALIKED repository.
+ARG LIGHTGLUE_COMMIT=5a650c444718caffc2669dc0094cde908f42dd73
+ARG ALIKED_COMMIT=683d7c65197395c0b3f01ebe76e1084a27e73a65
+RUN git clone https://github.com/cvg/LightGlue.git /opt/LightGlue \
+    && git -C /opt/LightGlue checkout ${LIGHTGLUE_COMMIT} \
+    && curl -sSL -o /opt/aliked-n16.pth \
+       https://github.com/Shiaoming/ALIKED/raw/${ALIKED_COMMIT}/models/aliked-n16.pth \
+    && echo "5be8704840ed662d9d8c561bf7279c222092674e7eb05fd0feab94899e9d82f2  /opt/aliked-n16.pth" \
+       | sha256sum -c -
