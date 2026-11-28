@@ -1,7 +1,7 @@
-// Minimal visual odometry with ORB features (OpenCV + PoseLib), stereo or mono.
+// Minimal visual odometry with ORB or SIFT features (OpenCV + PoseLib), stereo or mono.
 //
 // Stereo (cam0/ and cam1/ found), for every pair of consecutive epochs (k-1, k):
-//   1. Stereo: match ORB features between cam0 and cam1 at epoch k-1 and
+//   1. Stereo: match features between cam0 and cam1 at epoch k-1 and
 //      triangulate them -> 3D points in the cam0 frame of epoch k-1.
 //   2. Temporal: match those points' cam0 descriptors to cam0 at epoch k.
 //   3. Resection: RANSAC PnP (OpenCV or PoseLib) gives the pose of cam0 at
@@ -19,15 +19,17 @@
 // Usage:
 //   ./orb_matching <dataset_dir> <camera_calibration.yaml> [camera_rig.yaml] [delay_ms]
 //                  [--no-gui] [--scale S] [--sequential | --single-core]
-//                  [--pnp opencv|poselib] [--features N] [--report]
+//                  [--pnp opencv|poselib] [--detector orb|sift] [--features N] [--report]
 //
-//   --features N  number of ORB features per image (default 2000)
+//   --detector    local features: orb (default, binary, Hamming matching) or sift
+//                 (OpenCV SIFT, float descriptors, L2 matching; slower)
+//   --features N  number of features per image (default 2000)
 //   --report     print a timing table per processing stage at the end
 //   --pnp         resection solver: opencv (solvePnPRansac, default) or
 //                 poselib (P3P in LO-RANSAC + non-linear refinement)
 //   delay_ms      wait between frames in the GUI (default 0 = no wait)
 //   --no-gui      no windows, only terminal output (can be placed anywhere)
-//   --scale S     resize images by S before ORB, e.g. 0.5 = half size (default 1)
+//   --scale S     resize images by S before feature extraction, e.g. 0.5 = half size (default 1)
 //   --sequential  cam0 and cam1 one after the other, OpenCV internal threads on
 //   --single-core cam0 and cam1 one after the other, OpenCV internal threads off
 //   (default: cam0 and cam1 in parallel, OpenCV internal threads on)
@@ -62,9 +64,10 @@
 namespace fs = std::filesystem;
 
 enum class PnPSolver { OpenCV, PoseLib };
+enum class FeatureType { ORB, SIFT };
 
 // ---------------------------------------------------------------- settings --
-constexpr int kDefaultNumFeatures = 2000; // ORB features per image (--features)
+constexpr int kDefaultNumFeatures = 2000; // features per image (--features)
 constexpr float kRatioTest = 0.8f;        // Lowe's ratio test
 constexpr double kMaxReprojErrorPx = 2.0; // triangulation, PnP and essential matrix threshold
 constexpr double kMinDepth = 0.5;         // metres (stereo only)
@@ -281,11 +284,31 @@ std::vector<std::string> listImages(const fs::path& folder) {
     return names;
 }
 
+// "orb" | "sift" -> FeatureType; throws on anything else.
+FeatureType parseFeatureType(const std::string& name) {
+    if (name == "orb") return FeatureType::ORB;
+    if (name == "sift") return FeatureType::SIFT;
+    throw std::runtime_error("Unknown detector '" + name + "' (orb or sift)");
+}
+
+const char* featureName(FeatureType type) { return type == FeatureType::ORB ? "ORB" : "SIFT"; }
+
+// Detector + descriptor. Not thread-safe: create one per camera thread.
+//   ORB:  binary descriptors (CV_8U, 32 bytes), Hamming distance.
+//   SIFT: float descriptors (CV_32F, 128 values), L2 distance. Default OpenCV
+//         settings, best `num_features` keypoints by response.
+cv::Ptr<cv::Feature2D> createDetector(FeatureType type, int num_features) {
+    if (type == FeatureType::SIFT) return cv::SIFT::create(num_features);
+    return cv::ORB::create(num_features);
+}
+
+// Brute-force kNN matching with Lowe's ratio test. The norm follows the
+// descriptor type: Hamming for binary (ORB), L2 for float (SIFT).
 std::vector<cv::DMatch> matchDescriptors(const cv::Mat& desc_a, const cv::Mat& desc_b) {
     std::vector<cv::DMatch> good;
     if (desc_a.empty() || desc_b.empty()) return good;
 
-    cv::BFMatcher matcher(cv::NORM_HAMMING);
+    cv::BFMatcher matcher(desc_a.depth() == CV_8U ? cv::NORM_HAMMING : cv::NORM_L2);
     std::vector<std::vector<cv::DMatch>> knn;
     matcher.knnMatch(desc_a, desc_b, knn, 2);
     for (const auto& m : knn) {
@@ -296,8 +319,8 @@ std::vector<cv::DMatch> matchDescriptors(const cv::Mat& desc_a, const cv::Mat& d
     return good;
 }
 
-// Load, resize and extract ORB for one image.
-void processImage(const fs::path& path, double scale, cv::ORB& orb, Timings& timings,
+// Load, resize and extract features (ORB or SIFT) for one image.
+void processImage(const fs::path& path, double scale, cv::Feature2D& detector, Timings& timings,
                   cv::Mat& img, std::vector<cv::KeyPoint>& kp, cv::Mat& desc) {
     {
         ScopedTimer t(timings, "image load + resize (per img)");
@@ -305,25 +328,26 @@ void processImage(const fs::path& path, double scale, cv::ORB& orb, Timings& tim
         if (img.empty()) return;
         if (scale != 1.0) cv::resize(img, img, cv::Size(), scale, scale, cv::INTER_AREA);
     }
-    ScopedTimer t(timings, "ORB extraction (per img)");
-    orb.detectAndCompute(img, cv::noArray(), kp, desc);
+    ScopedTimer t(timings, "feature extraction (per img)");
+    detector.detectAndCompute(img, cv::noArray(), kp, desc);
 }
 
 // In mono mode only cam0 is loaded. Otherwise, with `parallel`, cam1 is
 // processed on a second thread while this thread processes cam0. Each thread
-// uses its own ORB detector (one detector is not thread-safe). Without it, the
+// uses its own detector (one detector is not thread-safe). Without it, the
 // two images are processed one after the other. Keypoints are the raw (distorted)
 // image positions; the camera model is applied in the geometry (triangulation,
 // PnP, essential matrix).
 bool loadFrame(const fs::path& dataset, const std::string& name, double scale, bool mono,
-               bool parallel, cv::ORB& orb0, cv::ORB& orb1, Timings& timings, Frame& f) {
-    ScopedTimer t(timings, "load + ORB (all cameras)");
+               bool parallel, cv::Feature2D& detector0, cv::Feature2D& detector1,
+               Timings& timings, Frame& f) {
+    ScopedTimer t(timings, "load + features (all cameras)");
     f.name = name;
     auto processCam0 = [&] {
-        processImage(dataset / "cam0" / name, scale, orb0, timings, f.img0, f.kp0, f.desc0);
+        processImage(dataset / "cam0" / name, scale, detector0, timings, f.img0, f.kp0, f.desc0);
     };
     auto processCam1 = [&] {
-        processImage(dataset / "cam1" / name, scale, orb1, timings, f.img1, f.kp1, f.desc1);
+        processImage(dataset / "cam1" / name, scale, detector1, timings, f.img1, f.kp1, f.desc1);
     };
     if (mono) {
         processCam0();
@@ -778,6 +802,7 @@ int main(int argc, char** argv) {
     double scale = 1.0;
     std::string pnp = "opencv";
     int num_features = kDefaultNumFeatures;
+    std::string detector = "orb";
     bool report = false;
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) {
@@ -789,15 +814,16 @@ int main(int argc, char** argv) {
         else if (arg == "--scale" && i + 1 < argc) scale = std::stod(argv[++i]);
         else if (arg == "--pnp" && i + 1 < argc) pnp = argv[++i];
         else if (arg == "--features" && i + 1 < argc) num_features = std::stoi(argv[++i]);
+        else if (arg == "--detector" && i + 1 < argc) detector = argv[++i];
         else args.push_back(arg);
     }
     const std::string usage =
         std::string("Usage: ") + argv[0] +
         " <dataset_dir> <camera_calibration.yaml> [camera_rig.yaml] [delay_ms]"
         " [--no-gui] [--scale S] [--sequential | --single-core]"
-        " [--pnp opencv|poselib] [--features N] [--report]\n";
+        " [--pnp opencv|poselib] [--detector orb|sift] [--features N] [--report]\n";
     if (args.size() < 2 || scale <= 0.0 || num_features <= 0 ||
-        (pnp != "opencv" && pnp != "poselib")) {
+        (pnp != "opencv" && pnp != "poselib") || (detector != "orb" && detector != "sift")) {
         std::cerr << usage;
         return 1;
     }
@@ -827,8 +853,9 @@ int main(int argc, char** argv) {
                              : parallel_cameras ? "stereo, parallel"
                              : opencv_threads ? "stereo, sequential"
                                               : "stereo, single-core";
+    const FeatureType feature_type = parseFeatureType(detector);
     std::cout << "Image scale: " << scale << ", mode: " << mode << ", PnP: " << pnp
-              << ", ORB features: " << num_features << "\n";
+              << ", " << featureName(feature_type) << " features: " << num_features << "\n";
 
     const std::vector<std::string> names = listImages(dataset / "cam0");
     if (names.empty()) {
@@ -836,9 +863,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // One ORB detector per camera, so both can run in parallel.
-    cv::Ptr<cv::ORB> orb0 = cv::ORB::create(num_features);
-    cv::Ptr<cv::ORB> orb1 = cv::ORB::create(num_features);
+    // One detector per camera, so both can run in parallel.
+    cv::Ptr<cv::Feature2D> detector0 = createDetector(feature_type, num_features);
+    cv::Ptr<cv::Feature2D> detector1 = createDetector(feature_type, num_features);
     const std::string matches_window = mono ? "temporal matches (cam0 n-1 | cam0 n)"
                                             : "stereo matches (cam0 | cam1)";
     if (gui) {
@@ -847,8 +874,8 @@ int main(int argc, char** argv) {
     }
 
     Timings timings;
-    timings.declare({"frame total", "load + ORB (all cameras)", "image load + resize (per img)",
-                     "ORB extraction (per img)", "temporal matching", "PnP RANSAC (opencv)",
+    timings.declare({"frame total", "load + features (all cameras)", "image load + resize (per img)",
+                     "feature extraction (per img)", "temporal matching", "PnP RANSAC (opencv)",
                      "PnP RANSAC (poselib)", "essential matrix (mono init)", "stereo matching",
                      "two-view matching (mono)", "triangulation + filtering", "visualization"});
 
@@ -864,8 +891,8 @@ int main(int argc, char** argv) {
         timer.start();
 
         Frame frame;
-        if (!loadFrame(dataset, name, scale, mono, parallel_cameras, *orb0, *orb1, timings,
-                       frame)) {
+        if (!loadFrame(dataset, name, scale, mono, parallel_cameras, *detector0, *detector1,
+                       timings, frame)) {
             std::cerr << "Skipping " << name << " (image missing or unreadable)\n";
             continue;
         }
