@@ -32,7 +32,10 @@
 //   --single-core cam0 and cam1 one after the other, OpenCV internal threads off
 //   (default: cam0 and cam1 in parallel, OpenCV internal threads on)
 //   dataset_dir   folder with cam0/ (and optionally cam1/) images with matching filenames
-//   calibration   per-camera PINHOLE intrinsics: params = [fx, fy, cx, cy]
+//   calibration   per-camera intrinsics, COLMAP camera models:
+//                 PINHOLE params = [fx, fy, cx, cy]
+//                 OPENCV  params = [fx, fy, cx, cy, k1, k2, p1, p2] (radial-tangential
+//                 distortion, used in triangulation, PnP and the essential matrix)
 //   rig           (stereo only) ROS-style pose of each camera in the rig (cam0 = identity):
 //                 p_cam0 = R * p_cam1 + t, quaternion [x, y, z, w]
 //
@@ -128,6 +131,10 @@ private:
 // ------------------------------------------------------------- data types --
 struct Calibration {
     cv::Matx33d K0, K1;
+    // OPENCV model: [k1, k2, p1, p2]; empty for PINHOLE. Keypoints stay raw
+    // (distorted); triangulation, PnP and the essential matrix use the model.
+    std::vector<double> dist0, dist1;
+    cv::Matx34d Rt1;     // [R | t] of cam1 relative to cam0 (stereo only)
     cv::Matx34d P0, P1;  // projection matrices, cam0 frame = reference (P1 stereo only)
 };
 
@@ -155,17 +162,28 @@ struct StepResult {
     cv::Mat img_a, img_b;
     std::vector<cv::KeyPoint> kp_a, kp_b;
     std::vector<cv::DMatch> matches;
+    // Stereo only: the 3D points triangulated in this step, in the cam0 frame
+    // of this epoch. points3d[i] is seen at kp_a[matches[i].queryIdx] (the
+    // cam0 keypoints of this epoch). Empty in mono mode.
+    std::vector<cv::Point3d> points3d;
 };
 
 // ------------------------------------------------------------- calibration --
 // Intrinsics for images resized by `scale`. Pixel centres are at integer
 // coordinates, so the principal point maps as (c + 0.5) * scale - 0.5.
-cv::Matx33d readIntrinsics(const cv::FileNode& cam, double scale) {
-    if (static_cast<std::string>(cam["model"]) != "PINHOLE") {
-        throw std::runtime_error("Only the PINHOLE camera model is supported");
+// OPENCV (COLMAP): fx, fy, cx, cy, k1, k2, p1, p2; the distortion goes to `dist`
+// (unchanged by `scale`: it acts on normalized coordinates).
+cv::Matx33d readIntrinsics(const cv::FileNode& cam, double scale, std::vector<double>& dist) {
+    const std::string model = cam["model"];
+    if (model != "PINHOLE" && model != "OPENCV") {
+        throw std::runtime_error("Only the PINHOLE and OPENCV camera models are supported");
     }
     std::vector<double> p;
-    cam["params"] >> p;  // fx, fy, cx, cy
+    cam["params"] >> p;  // fx, fy, cx, cy[, k1, k2, p1, p2]
+    if (p.size() != (model == "PINHOLE" ? 4u : 8u)) {
+        throw std::runtime_error(model + ": wrong number of params");
+    }
+    dist.assign(p.begin() + 4, p.end());
     const double fx = p[0] * scale, fy = p[1] * scale;
     const double cx = (p[2] + 0.5) * scale - 0.5, cy = (p[3] + 0.5) * scale - 0.5;
     return {fx, 0.0, cx,
@@ -199,11 +217,13 @@ Calibration loadCalibration(const std::string& calibration_file, const std::stri
                             double scale) {
     cv::FileStorage calib = openYaml(calibration_file);
     Calibration c;
-    c.K0 = readIntrinsics(calib["cam0"], scale);
+    c.K0 = readIntrinsics(calib["cam0"], scale, c.dist0);
     c.P0 = c.K0 * cv::Matx34d::eye();
+    if (!c.dist0.empty()) std::cout << "cam0: OPENCV camera model (with distortion)\n";
     if (rig_file.empty()) return c;
 
-    c.K1 = readIntrinsics(calib["cam1"], scale);
+    c.K1 = readIntrinsics(calib["cam1"], scale, c.dist1);
+    if (!c.dist1.empty()) std::cout << "cam1: OPENCV camera model (with distortion)\n";
 
     // Rig file stores the pose of cam1 in the cam0 frame (T_cam0_cam1).
     cv::FileStorage rig = openYaml(rig_file);
@@ -223,6 +243,7 @@ Calibration loadCalibration(const std::string& calibration_file, const std::stri
         Rt1(r, 3) = t_1_0[r];
     }
     c.P1 = c.K1 * Rt1;
+    c.Rt1 = Rt1;
 
     std::cout << "Baseline: " << cv::norm(t_0_1) << " m\n";
     return c;
@@ -291,7 +312,9 @@ void processImage(const fs::path& path, double scale, cv::ORB& orb, Timings& tim
 // In mono mode only cam0 is loaded. Otherwise, with `parallel`, cam1 is
 // processed on a second thread while this thread processes cam0. Each thread
 // uses its own ORB detector (one detector is not thread-safe). Without it, the
-// two images are processed one after the other.
+// two images are processed one after the other. Keypoints are the raw (distorted)
+// image positions; the camera model is applied in the geometry (triangulation,
+// PnP, essential matrix).
 bool loadFrame(const fs::path& dataset, const std::string& name, double scale, bool mono,
                bool parallel, cv::ORB& orb0, cv::ORB& orb1, Timings& timings, Frame& f) {
     ScopedTimer t(timings, "load + ORB (all cameras)");
@@ -317,17 +340,56 @@ bool loadFrame(const fs::path& dataset, const std::string& name, double scale, b
     return !f.img0.empty() && !f.img1.empty();
 }
 
-// ------------------------------------------------------------ triangulation --
-double reprojectionError(const cv::Matx34d& P, const cv::Vec4d& X, const cv::Point2d& uv) {
-    const cv::Vec3d x = P * X;
-    return std::hypot(x[0] / x[2] - uv.x, x[1] / x[2] - uv.y);
+// ------------------------------------------------------------ camera model --
+// COLMAP OPENCV model: pixel = K * distort(x, y), with (x, y) = (X/Z, Y/Z) and
+// radial-tangential distortion [k1, k2, p1, p2]. PINHOLE = empty `dist`.
+
+// Pixel -> normalized image coordinates (distortion removed). The inverse of
+// the distortion is iterative; OpenCV's default of 5 iterations is not enough
+// for strong distortion near the image corners, so iterate to convergence.
+std::vector<cv::Point2d> normalizePoints(const std::vector<cv::Point2d>& uv, const cv::Matx33d& K,
+                                         const std::vector<double>& dist) {
+    std::vector<cv::Point2d> xy;
+    if (uv.empty()) return xy;
+    cv::undistortPoints(uv, xy, K, dist, cv::noArray(), cv::noArray(),
+                        cv::TermCriteria(cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 50, 1e-12));
+    return xy;
 }
 
-// Triangulates matches (query = view a, train = view b) seen by the projection
-// matrices Pa and Pb (expressed in the same frame). Keeps the points in front of
-// both views, with depth in view a within [min_depth, max_depth], and consistent
-// with both observations. `kept` receives the matches of the points returned.
-std::vector<cv::Point3d> triangulateMatches(const cv::Matx34d& Pa, const cv::Matx34d& Pb,
+// Camera-frame point -> pixel, with the distortion.
+cv::Point2d projectPoint(const cv::Vec3d& p_cam, const cv::Matx33d& K,
+                         const std::vector<double>& dist) {
+    double x = p_cam[0] / p_cam[2], y = p_cam[1] / p_cam[2];
+    if (!dist.empty()) {
+        const double k1 = dist[0], k2 = dist[1], p1 = dist[2], p2 = dist[3];
+        const double r2 = x * x + y * y, radial = 1.0 + k1 * r2 + k2 * r2 * r2;
+        const double xd = x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
+        const double yd = y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
+        x = xd;
+        y = yd;
+    }
+    return {K(0, 0) * x + K(0, 1) * y + K(0, 2), K(1, 1) * y + K(1, 2)};
+}
+
+// ------------------------------------------------------------ triangulation --
+// Reprojection error in pixels of X (frame of Rt) in a camera with pose Rt.
+double reprojectionError(const cv::Matx33d& K, const std::vector<double>& dist,
+                         const cv::Matx34d& Rt, const cv::Vec4d& X, const cv::Point2d& uv) {
+    const cv::Point2d p = projectPoint(Rt * X, K, dist);
+    return std::hypot(p.x - uv.x, p.y - uv.y);
+}
+
+// Triangulates matches (query = view a, train = view b) seen by two cameras
+// (intrinsics K, distortion `dist`, pose Rt = [R | t]: p_cam = Rt * p, all in the
+// same frame). The observations go through the camera model to normalized
+// coordinates, the points are triangulated there (DLT), and kept if in front of
+// both views, with depth in view a within [min_depth, max_depth], and with a
+// reprojection error (with distortion, in pixels) below the threshold in both
+// views. `kept` receives the matches of the points returned.
+std::vector<cv::Point3d> triangulateMatches(const cv::Matx33d& Ka, const std::vector<double>& dist_a,
+                                            const cv::Matx34d& Rt_a,
+                                            const cv::Matx33d& Kb, const std::vector<double>& dist_b,
+                                            const cv::Matx34d& Rt_b,
                                             const std::vector<cv::KeyPoint>& kp_a,
                                             const std::vector<cv::KeyPoint>& kp_b,
                                             const std::vector<cv::DMatch>& matches,
@@ -341,8 +403,10 @@ std::vector<cv::Point3d> triangulateMatches(const cv::Matx34d& Pa, const cv::Mat
         uv_a.push_back(kp_a[m.queryIdx].pt);
         uv_b.push_back(kp_b[m.trainIdx].pt);
     }
+    const std::vector<cv::Point2d> xy_a = normalizePoints(uv_a, Ka, dist_a);
+    const std::vector<cv::Point2d> xy_b = normalizePoints(uv_b, Kb, dist_b);
     cv::Mat X4;
-    cv::triangulatePoints(cv::Mat(Pa), cv::Mat(Pb), uv_a, uv_b, X4);
+    cv::triangulatePoints(cv::Mat(Rt_a), cv::Mat(Rt_b), xy_a, xy_b, X4);
     X4.convertTo(X4, CV_64F);
 
     for (size_t i = 0; i < matches.size(); ++i) {
@@ -351,12 +415,11 @@ std::vector<cv::Point3d> triangulateMatches(const cv::Matx34d& Pa, const cv::Mat
         const cv::Vec4d X(X4.at<double>(0, i) / w, X4.at<double>(1, i) / w,
                           X4.at<double>(2, i) / w, 1.0);
 
-        // P = K [R | t] and the last row of K is [0 0 1], so (P X)_z is the depth.
-        const double depth_a = (Pa * X)[2];
-        const double depth_b = (Pb * X)[2];
+        const double depth_a = (Rt_a * X)[2];
+        const double depth_b = (Rt_b * X)[2];
         if (depth_a < min_depth || depth_a > max_depth || depth_b <= 0) continue;
-        if (reprojectionError(Pa, X, uv_a[i]) > kMaxReprojErrorPx) continue;
-        if (reprojectionError(Pb, X, uv_b[i]) > kMaxReprojErrorPx) continue;
+        if (reprojectionError(Ka, dist_a, Rt_a, X, uv_a[i]) > kMaxReprojErrorPx) continue;
+        if (reprojectionError(Kb, dist_b, Rt_b, X, uv_b[i]) > kMaxReprojErrorPx) continue;
 
         points.emplace_back(X[0], X[1], X[2]);
         kept.push_back(matches[i]);
@@ -373,8 +436,8 @@ TriangulatedPoints triangulateStereo(const Frame& f, const Calibration& c, Timin
         matches = matchDescriptors(f.desc0, f.desc1);
     }
     ScopedTimer t(timings, "triangulation + filtering");
-    out.points = triangulateMatches(c.P0, c.P1, f.kp0, f.kp1, matches, kMinDepth, kMaxDepth,
-                                    out.matches);
+    out.points = triangulateMatches(c.K0, c.dist0, cv::Matx34d::eye(), c.K1, c.dist1, c.Rt1,
+                                    f.kp0, f.kp1, matches, kMinDepth, kMaxDepth, out.matches);
     for (const auto& m : out.matches) out.desc.push_back(f.desc0.row(m.queryIdx));
     return out;
 }
@@ -383,7 +446,8 @@ TriangulatedPoints triangulateStereo(const Frame& f, const Calibration& c, Timin
 // -> points in the world frame. Descriptors are taken from view b (the newer).
 TriangulatedPoints triangulateTwoViews(const Frame& a, const cv::Matx44d& T_a_world,
                                        const Frame& b, const cv::Matx44d& T_b_world,
-                                       const cv::Matx33d& K, Timings& timings) {
+                                       const cv::Matx33d& K, const std::vector<double>& dist,
+                                       Timings& timings) {
     TriangulatedPoints out;
     std::vector<cv::DMatch> matches;
     {
@@ -391,10 +455,10 @@ TriangulatedPoints triangulateTwoViews(const Frame& a, const cv::Matx44d& T_a_wo
         matches = matchDescriptors(a.desc0, b.desc0);
     }
     ScopedTimer t(timings, "triangulation + filtering");
-    const cv::Matx34d Pa = K * T_a_world.get_minor<3, 4>(0, 0);
-    const cv::Matx34d Pb = K * T_b_world.get_minor<3, 4>(0, 0);
+    const cv::Matx34d Rt_a = T_a_world.get_minor<3, 4>(0, 0);
+    const cv::Matx34d Rt_b = T_b_world.get_minor<3, 4>(0, 0);
     // No metric depth range in mono: the scale is arbitrary.
-    out.points = triangulateMatches(Pa, Pb, a.kp0, b.kp0, matches, 0.0,
+    out.points = triangulateMatches(K, dist, Rt_a, K, dist, Rt_b, a.kp0, b.kp0, matches, 0.0,
                                     std::numeric_limits<double>::infinity(), out.matches);
     for (const auto& m : out.matches) out.desc.push_back(b.desc0.row(m.trainIdx));
     return out;
@@ -403,10 +467,13 @@ TriangulatedPoints triangulateTwoViews(const Frame& a, const cv::Matx44d& T_a_wo
 // --------------------------------------------------------------- resection --
 // Both solvers return T with p_camera = T * p_points (points' frame -> camera).
 
+// `image` holds raw (distorted) pixels; `dist` is the OPENCV distortion (empty = PINHOLE).
 bool solvePnPOpenCV(const std::vector<cv::Point3d>& object, const std::vector<cv::Point2d>& image,
-                    const cv::Matx33d& K, cv::Matx44d& T, int& num_inliers) {
+                    const cv::Matx33d& K, const std::vector<double>& dist, cv::Matx44d& T,
+                    int& num_inliers) {
     cv::Mat rvec, tvec, inliers;
-    const bool ok = cv::solvePnPRansac(object, image, cv::Mat(K), cv::noArray(), rvec, tvec,
+    const bool ok = cv::solvePnPRansac(object, image, cv::Mat(K),
+                                       dist.empty() ? cv::Mat() : cv::Mat(dist), rvec, tvec,
                                        false, 1000, kMaxReprojErrorPx, 0.999, inliers);
     num_inliers = inliers.rows;
     if (!ok) return false;
@@ -418,8 +485,8 @@ bool solvePnPOpenCV(const std::vector<cv::Point3d>& object, const std::vector<cv
 }
 
 bool solvePnPPoseLib(const std::vector<cv::Point3d>& object, const std::vector<cv::Point2d>& image,
-                     const cv::Matx33d& K, const cv::Size& image_size, cv::Matx44d& T,
-                     int& num_inliers) {
+                     const cv::Matx33d& K, const std::vector<double>& dist,
+                     const cv::Size& image_size, cv::Matx44d& T, int& num_inliers) {
     std::vector<Eigen::Vector3d> points3D;
     std::vector<Eigen::Vector2d> points2D;
     points3D.reserve(object.size());
@@ -429,7 +496,10 @@ bool solvePnPPoseLib(const std::vector<cv::Point3d>& object, const std::vector<c
         points2D.emplace_back(image[i].x, image[i].y);
     }
 
-    const poselib::Camera camera("PINHOLE", {K(0, 0), K(1, 1), K(0, 2), K(1, 2)},
+    // Same COLMAP model and parameter order in PoseLib: the raw pixels go in.
+    std::vector<double> params{K(0, 0), K(1, 1), K(0, 2), K(1, 2)};
+    params.insert(params.end(), dist.begin(), dist.end());
+    const poselib::Camera camera(dist.empty() ? "PINHOLE" : "OPENCV", params,
                                  image_size.width, image_size.height);
     poselib::RansacOptions ransac;
     ransac.max_reproj_error = kMaxReprojErrorPx;  // pixels
@@ -458,7 +528,8 @@ bool solvePnPPoseLib(const std::vector<cv::Point3d>& object, const std::vector<c
 // `matches_out` (optional) receives the temporal matches (query = point index,
 // train = keypoint of cam0 in `curr`).
 bool estimateMotion(const TriangulatedPoints& points, const Frame& curr, const cv::Matx33d& K0,
-                    PnPSolver solver, Timings& timings, cv::Matx44d& T, int& num_inliers,
+                    const std::vector<double>& dist0, PnPSolver solver, Timings& timings,
+                    cv::Matx44d& T, int& num_inliers,
                     std::vector<cv::DMatch>* matches_out = nullptr) {
     std::vector<cv::Point3d> object;
     std::vector<cv::Point2d> image;
@@ -477,16 +548,17 @@ bool estimateMotion(const TriangulatedPoints& points, const Frame& curr, const c
     ScopedTimer t(timings, solver == PnPSolver::PoseLib ? "PnP RANSAC (poselib)"
                                                         : "PnP RANSAC (opencv)");
     const bool ok = (solver == PnPSolver::PoseLib)
-        ? solvePnPPoseLib(object, image, K0, curr.img0.size(), T, num_inliers)
-        : solvePnPOpenCV(object, image, K0, T, num_inliers);
+        ? solvePnPPoseLib(object, image, K0, dist0, curr.img0.size(), T, num_inliers)
+        : solvePnPOpenCV(object, image, K0, dist0, T, num_inliers);
     return ok && num_inliers >= kMinInliers;
 }
 
 // Relative pose of cam0 from frame a to frame b (p_b = T_b_a * p_a) with the
 // essential matrix (5-point RANSAC). The translation has unit length.
 // `matches` receives the matches used (query = a, train = b).
-bool estimateEssential(const Frame& a, const Frame& b, const cv::Matx33d& K, Timings& timings,
-                       cv::Matx44d& T_b_a, int& num_inliers, std::vector<cv::DMatch>& matches) {
+bool estimateEssential(const Frame& a, const Frame& b, const cv::Matx33d& K,
+                       const std::vector<double>& dist, Timings& timings, cv::Matx44d& T_b_a,
+                       int& num_inliers, std::vector<cv::DMatch>& matches) {
     {
         ScopedTimer t(timings, "temporal matching");
         matches = matchDescriptors(a.desc0, b.desc0);
@@ -501,12 +573,23 @@ bool estimateEssential(const Frame& a, const Frame& b, const cv::Matx33d& K, Tim
         uv_b.push_back(b.kp0[m.trainIdx].pt);
     }
     cv::Mat mask;
-    const cv::Mat E = cv::findEssentialMat(uv_a, uv_b, cv::Mat(K), cv::RANSAC, 0.999,
-                                           kMaxReprojErrorPx, mask);
-    if (E.rows < 3) return false;  // can hold several 3x3 solutions: use the first
-
     cv::Mat R, tvec;
-    num_inliers = cv::recoverPose(E.rowRange(0, 3), uv_a, uv_b, cv::Mat(K), R, tvec, mask);
+    if (dist.empty()) {
+        const cv::Mat E = cv::findEssentialMat(uv_a, uv_b, cv::Mat(K), cv::RANSAC, 0.999,
+                                               kMaxReprojErrorPx, mask);
+        if (E.rows < 3) return false;  // can hold several 3x3 solutions: use the first
+        num_inliers = cv::recoverPose(E.rowRange(0, 3), uv_a, uv_b, cv::Mat(K), R, tvec, mask);
+    } else {
+        // OPENCV model: the epipolar geometry holds for normalized coordinates
+        // (distortion removed); the pixel threshold is scaled by the focal length.
+        const std::vector<cv::Point2d> xy_a = normalizePoints(uv_a, K, dist);
+        const std::vector<cv::Point2d> xy_b = normalizePoints(uv_b, K, dist);
+        const cv::Mat I = cv::Mat::eye(3, 3, CV_64F);
+        const double threshold = kMaxReprojErrorPx / (0.5 * (K(0, 0) + K(1, 1)));
+        const cv::Mat E = cv::findEssentialMat(xy_a, xy_b, I, cv::RANSAC, 0.999, threshold, mask);
+        if (E.rows < 3) return false;
+        num_inliers = cv::recoverPose(E.rowRange(0, 3), xy_a, xy_b, I, R, tvec, mask);
+    }
     if (num_inliers < kMinInliers) return false;
     T_b_a = makeTransform(R, tvec);
     return true;
@@ -523,8 +606,8 @@ public:
         StepResult r;
         if (prev_points_) {
             cv::Matx44d T_curr_prev;
-            if (estimateMotion(*prev_points_, f, calib_.K0, solver_, timings_, T_curr_prev,
-                               r.num_inliers)) {
+            if (estimateMotion(*prev_points_, f, calib_.K0, calib_.dist0, solver_, timings_,
+                               T_curr_prev, r.num_inliers)) {
                 T_world_cam_ = T_world_cam_ * T_curr_prev.inv();
                 r.pose_updated = true;
                 r.status = "ok";
@@ -541,6 +624,7 @@ public:
         r.img_a = f.img0; r.kp_a = f.kp0;
         r.img_b = f.img1; r.kp_b = f.kp1;
         r.matches = prev_points_->matches;
+        r.points3d = prev_points_->points;
         return r;
     }
 
@@ -555,8 +639,10 @@ private:
 // Mono: triangulate cam0 at n-2 and n-1, resection of cam0 at n.
 class MonoOdometry {
 public:
-    MonoOdometry(const cv::Matx33d& K, PnPSolver solver, Timings& timings)
-        : K_(K), solver_(solver), timings_(timings) {}
+    // `dist`: OPENCV distortion of cam0 (empty = PINHOLE).
+    MonoOdometry(const cv::Matx33d& K, PnPSolver solver, Timings& timings,
+                 std::vector<double> dist = {})
+        : K_(K), dist_(std::move(dist)), solver_(solver), timings_(timings) {}
 
     StepResult process(const Frame& f) {
         StepResult r;
@@ -590,6 +676,18 @@ public:
         return r;
     }
 
+    // Replaces the pose of the frame just processed (e.g. by a motion model in
+    // the caller), so the next process() triangulates and resects from it.
+    void setLastPose(const cv::Matx44d& T_world_cam) {
+        if (!prev1_) return;
+        prev1_->T_cam_world = T_world_cam.inv();
+        if (prev2_) {
+            const double step = cv::norm(cameraCenter(prev1_->T_cam_world) -
+                                         cameraCenter(prev2_->T_cam_world));
+            if (step > 0) step_length_ = step;
+        }
+    }
+
 private:
     struct View {
         Frame frame;
@@ -599,12 +697,14 @@ private:
     // Triangulate n-2 and n-1, then resection of n on those world points.
     bool resection(const Frame& f, cv::Matx44d& T_cam_world, StepResult& r) {
         const TriangulatedPoints points = triangulateTwoViews(
-            prev2_->frame, prev2_->T_cam_world, prev1_->frame, prev1_->T_cam_world, K_, timings_);
+            prev2_->frame, prev2_->T_cam_world, prev1_->frame, prev1_->T_cam_world, K_, dist_,
+            timings_);
         r.num_points = points.points.size();
 
         cv::Matx44d T;
         std::vector<cv::DMatch> temporal;
-        if (!estimateMotion(points, f, K_, solver_, timings_, T, r.num_inliers, &temporal)) {
+        if (!estimateMotion(points, f, K_, dist_, solver_, timings_, T, r.num_inliers,
+                            &temporal)) {
             return false;
         }
         T_cam_world = T;
@@ -621,7 +721,7 @@ private:
     // the last known step length (1 at start-up).
     bool initialise(const Frame& f, cv::Matx44d& T_cam_world, StepResult& r) {
         cv::Matx44d T_curr_prev;
-        if (!estimateEssential(prev1_->frame, f, K_, timings_, T_curr_prev, r.num_inliers,
+        if (!estimateEssential(prev1_->frame, f, K_, dist_, timings_, T_curr_prev, r.num_inliers,
                                r.matches)) {
             return false;
         }
@@ -632,6 +732,7 @@ private:
     }
 
     cv::Matx33d K_;
+    std::vector<double> dist_;
     PnPSolver solver_;
     Timings& timings_;
     std::optional<View> prev1_, prev2_;  // epochs n-1 and n-2
@@ -752,7 +853,7 @@ int main(int argc, char** argv) {
                      "two-view matching (mono)", "triangulation + filtering", "visualization"});
 
     StereoOdometry stereo_vo(calib, solver, timings);
-    MonoOdometry mono_vo(calib.K0, solver, timings);
+    MonoOdometry mono_vo(calib.K0, solver, timings, calib.dist0);
 
     std::vector<cv::Point2d> trajectory{{0.0, 0.0}};
     bool paused = false;
