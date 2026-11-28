@@ -127,16 +127,25 @@ private:
         options.SetIntraOpNumThreads(std::max(1, static_cast<int>(std::thread::hardware_concurrency()) / 2));
         options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         if (cuda) {
-            OrtCUDAProviderOptions cuda_options{};
-            cuda_options.device_id = 0;
+            const OrtApi& api = Ort::GetApi();
+            OrtCUDAProviderOptionsV2* raw = nullptr;
+            Ort::ThrowOnError(api.CreateCUDAProviderOptions(&raw));
+            std::unique_ptr<OrtCUDAProviderOptionsV2, void (*)(OrtCUDAProviderOptionsV2*)> cuda_options(
+                raw, [](OrtCUDAProviderOptionsV2* p) { Ort::GetApi().ReleaseCUDAProviderOptions(p); });
+            // GPU memory is tight (full-resolution 128-channel maps are 190-300
+            // MB each, and a laptop GPU may have 4 GB shared with NetVLAD):
+            //  - grow the memory pool by what is requested, not to the next
+            //    power of two;
+            //  - do not let cuDNN take the largest possible workspace for the
+            //    fastest convolution algorithm.
             // Fixed image size during a run: search the fastest convolutions
             // once. Inputs that change every call (keypoints): heuristic.
-            cuda_options.cudnn_conv_algo_search = fixed_input_size
-                ? OrtCudnnConvAlgoSearchExhaustive : OrtCudnnConvAlgoSearchHeuristic;
-            // Grow the GPU memory pool by what is requested, not to the next
-            // power of two: full-resolution 128-channel maps are ~190 MB each.
-            cuda_options.arena_extend_strategy = 1;  // kSameAsRequested
-            options.AppendExecutionProvider_CUDA(cuda_options);
+            const char* keys[] = {"device_id", "arena_extend_strategy", "cudnn_conv_use_max_workspace",
+                                  "cudnn_conv_algo_search"};
+            const char* values[] = {"0", "kSameAsRequested", "0",
+                                    fixed_input_size ? "EXHAUSTIVE" : "HEURISTIC"};
+            Ort::ThrowOnError(api.UpdateCUDAProviderOptions(cuda_options.get(), keys, values, 4));
+            options.AppendExecutionProvider_CUDA_V2(*cuda_options);
         }
         return std::make_unique<Ort::Session>(ortEnv(), path.c_str(), options);
     }
@@ -318,13 +327,22 @@ public:
         cv::copyMakeBorder(image, padded, top, pad_h - top, left, pad_w - left, cv::BORDER_REPLICATE);
         const int Hp = padded.rows, Wp = padded.cols;
 
-        // Dense maps. The feature map (128 x Hp x Wp floats, 190 MB at 768 x 480)
-        // stays on the model's device (GPU) and goes straight to the
-        // descriptor model, which crops it; only the score map comes back.
+        // Dense maps. The feature map (128 x Hp x Wp floats: 190 MB at 768 x 480,
+        // 300 MB at 960 x 608) stays on the model's device (GPU) and goes
+        // straight to the descriptor model; only the score map comes back. It
+        // is never cropped either: the dense model sets it to zero outside
+        // `crop`, the descriptor model reads it shifted.
+        // One extraction at a time in the process (cam0 and cam1 share the
+        // models), so only one feature map exists at a time: GPU memory.
+        static std::mutex extraction;
+        std::lock_guard<std::mutex> lock(extraction);
         std::vector<float> input(padded.begin<float>(), padded.end<float>());
+        std::vector<int64_t> crop{top, left, H, W};
         Ort::Value image_tensor = OrtModel::tensor(input, {1, 1, Hp, Wp});
+        Ort::Value crop_tensor = OrtModel::tensor(crop, {4});
         Ort::IoBinding binding(dense_->session());
         binding.BindInput("image", image_tensor);
+        binding.BindInput("crop", crop_tensor);
         binding.BindOutput("feature_map", dense_->deviceMemory());
         binding.BindOutput("score_map", OrtModel::cpuMemory());
         dense_->run(binding);
@@ -403,7 +421,6 @@ public:
         // SDDH descriptors (second model).
         cv::Mat desc(static_cast<int>(n), kDim, CV_32F);
         if (n > 0) {
-            std::vector<int64_t> crop{top, left, H, W};
             std::vector<Ort::Value> desc_inputs;
             desc_inputs.push_back(std::move(dense[0]));  // padded feature map, on the device
             desc_inputs.push_back(OrtModel::tensor(crop, {4}));

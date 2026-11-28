@@ -9,19 +9,24 @@ Dockerfile.export.
 Two ONNX models; the keypoint detection in between (DKD: NMS, top-k, sub-pixel
 soft-argmax, scores) is done in C++ (src/deep_features.h), as in aliked.py:
 
-  aliked-n16_dense.onnx (H, W dynamic, multiples of 32; C++ pads the image by
-  edge replication and crops the maps, like InputPadder):
-    input  "image":       1 x 1 x H x W, float32, grayscale, values 0-1
-    output "feature_map": 1 x 128 x H x W, L2-normalized
-    output "score_map":   1 x 1 x H x W, keypoint scores 0-1
+  aliked-n16_dense.onnx (Hp, Wp dynamic, multiples of 32; C++ pads the image by
+  edge replication like InputPadder, and crops the score map):
+    input  "image":       1 x 1 x Hp x Wp, float32, grayscale, values 0-1
+    input  "crop":        4, int64: top, left, H, W of the image in the padded image
+    output "feature_map": 1 x 128 x Hp x Wp, L2-normalized, zero outside the crop
+    output "score_map":   1 x 1 x Hp x Wp, keypoint scores 0-1
 
   aliked-n16_desc.onnx (SDDH descriptor head; N and the map size dynamic):
-    input  "feature_map": 1 x 128 x Hp x Wp, the dense model's output (padded)
-    input  "crop":        4, int64: top, left, H, W of the image in the padded map
+    input  "feature_map": 1 x 128 x Hp x Wp, the dense model's output
+    input  "crop":        4, int64, as above
     input  "keypoints":   N x 2, float32, pixel coordinates (x, y) in the image
     output "descriptors": N x 128, L2-normalized
-  The feature map goes straight from one model to the other (it can stay on
-  the GPU); the crop (InputPadder.unpad) is done inside.
+
+  The feature map goes straight from one model to the other (it stays on the
+  GPU) and is never cropped (at 960 x 608 it is 300 MB; a crop is one more
+  copy). SDDH only reads 3 x 3 patches and bilinear samples of it: they are
+  taken at the shifted positions in the padded map, which is zero outside the
+  crop, exactly like grid_sample's zero padding of the cropped map.
 
 Changes for the export, numerically checked against the original below:
   - Deformable convolutions (torchvision.ops.deform_conv2d, blocks 3 and 4)
@@ -119,31 +124,38 @@ def replace_dcn(module: nn.Module):
 
 
 class AlikedDense(nn.Module):
-    """ALIKED.extract_dense_map without the padding (done in C++)."""
+    """ALIKED.extract_dense_map without the padding (done in C++).
+
+    The feature map is not unpadded but set to zero outside `crop`, see the
+    module docstring.
+    """
 
     def __init__(self, m):
         super().__init__()
         self.m = m
 
-    def forward(self, image):
+    def forward(self, image, crop):
         m = self.m
         image = image.repeat(1, 3, 1, 1)  # grayscale -> RGB, as kornia grayscale_to_rgb
         x1 = m.block1(image)
         x2 = m.block2(m.pool2(x1))
         x3 = m.block3(m.pool4(x2))
         x4 = m.block4(m.pool4(x3))
-        x1 = m.gate(m.conv1(x1))
-        x2 = m.gate(m.conv2(x2))
-        x3 = m.gate(m.conv3(x3))
-        x4 = m.gate(m.conv4(x4))
-        x1234 = torch.cat([x1, m.upsample2(x2), m.upsample8(x3), m.upsample32(x4)], dim=1)
+        parts = [m.gate(m.conv1(x1)), m.upsample2(m.gate(m.conv2(x2))),
+                 m.upsample8(m.gate(m.conv3(x3))), m.upsample32(m.gate(m.conv4(x4)))]
+        x1234 = torch.cat(parts, dim=1)
         score_map = torch.sigmoid(m.score_head(x1234))
-        # F.normalize(x1234, p=2, dim=1), written out: exported as ReduceL2 it
-        # asks ONNX Runtime's CUDA provider for ~4x the map size of workspace
-        # (755 MB at 768 x 480), more than a 4 GB laptop GPU can give.
-        norm = torch.sqrt((x1234 * x1234).sum(dim=1, keepdim=True)).clamp(min=1e-12)
-        feature_map = x1234 / norm
-        return feature_map, score_map
+        # F.normalize(x1234, p=2, dim=1), written out to save GPU memory: as
+        # ReduceL2 it asks ONNX Runtime's CUDA provider for ~4x the map size of
+        # workspace, and x1234 * x1234 would be one more full-size map. The sum
+        # of squares is taken per 32-channel part instead.
+        sum_sq = sum((p * p).sum(dim=1, keepdim=True) for p in parts)
+        # 1 / norm inside the crop, 0 in the padding.
+        gx, gy = pixel_grid(score_map)
+        inside = ((gy >= crop[0]) & (gy < crop[0] + crop[2]) &
+                  (gx >= crop[1]) & (gx < crop[1] + crop[3])).to(x1234.dtype)
+        scale = inside / torch.sqrt(sum_sq).clamp(min=1e-12)
+        return x1234 * scale, score_map
 
 
 class AlikedDesc(nn.Module):
@@ -157,14 +169,12 @@ class AlikedDesc(nn.Module):
     def forward(self, feature_map, crop, keypoints):
         s = self.s
         c = feature_map.shape[1]  # constant (128)
-        # Crop the padded map to the image (InputPadder.unpad) here, so the C++
-        # side can leave the map on the GPU. crop = [top, left, h, w].
-        h, w = crop[2], crop[3]
-        dev = feature_map.device
-        feature_map = feature_map.index_select(2, crop[0] + torch.arange(h, device=dev))
-        feature_map = feature_map.index_select(3, crop[1] + torch.arange(w, device=dev))
+        # feature_map: padded, zero outside crop = [top, left, h, w]. Sizes and
+        # positions below are those of the cropped map (as in the original);
+        # the map is read at (position + [left, top]).
+        top, left, h, w = crop[0], crop[1], crop[2], crop[3]
+        hp, wp = shape_hw(feature_map)
         dtype = feature_map.dtype
-        wh = torch.stack([w - 1, h - 1]).to(dtype)
         max_offset = torch.maximum(h, w).to(dtype) / 4.0
         # get_patches(): 3x3 patch whose corner is (kpt - 1.5 + 1).long(), clamped
         kl = keypoints.long()
@@ -172,14 +182,19 @@ class AlikedDesc(nn.Module):
         cx = torch.minimum(torch.clamp(corner[:, 0], min=0), w - 4)
         cy = torch.minimum(torch.clamp(corner[:, 1], min=0), h - 4)
         r = torch.arange(3, device=keypoints.device)
-        index = (cy[:, None, None] + r[None, :, None]) * w + (cx[:, None, None] + r[None, None, :])
-        flat = feature_map[0].reshape(c, -1)
+        index = ((top + cy)[:, None, None] + r[None, :, None]) * wp + \
+            ((left + cx)[:, None, None] + r[None, None, :])
+        flat = feature_map.reshape(c, -1)  # batch 1; not feature_map[0]: a Gather = full copy
         patch = flat[:, index.reshape(-1)].reshape(c, -1, 3, 3).permute(1, 0, 2, 3)  # N x C x 3 x 3
         offset = s.offset_conv(patch)
         offset = torch.minimum(torch.maximum(offset, -max_offset), max_offset)
         offset = offset[:, :, 0, 0].reshape(-1, 2, s.n_pos).permute(0, 2, 1)  # N x M x 2
-        pos = keypoints[:, None, :] + offset
-        pos = 2.0 * pos / wh - 1
+        pos = keypoints[:, None, :] + offset  # cropped-map pixels
+        # grid_sample(align_corners=True) on the padded map at the same pixels:
+        # neighbours outside the crop are 0 there, as outside the cropped map.
+        shift = torch.stack([left, top]).to(dtype)
+        whp = torch.stack([wp - 1, hp - 1]).to(dtype)
+        pos = 2.0 * (pos + shift) / whp - 1
         features = F.grid_sample(feature_map, pos.reshape(1, -1, 1, 2), mode="bilinear",
                                  align_corners=True)  # 1 x C x (N*M) x 1
         features = features.reshape(c, -1, s.n_pos, 1).permute(1, 0, 2, 3)  # N x C x M x 1
@@ -211,11 +226,12 @@ def main():
 
     dense_path, desc_path = f"{MODEL}_dense.onnx", f"{MODEL}_desc.onnx"
     with torch.no_grad():
-        torch.onnx.export(dense, (torch.rand(1, 1, 480, 640),), dense_path, opset_version=17,
-                          input_names=["image"], output_names=["feature_map", "score_map"],
-                          dynamic_axes={"image": {2: "H", 3: "W"},
-                                        "feature_map": {2: "H", 3: "W"},
-                                        "score_map": {2: "H", 3: "W"}})
+        torch.onnx.export(dense, (torch.rand(1, 1, 480, 640), torch.tensor([0, 4, 480, 632])),
+                          dense_path, opset_version=17,
+                          input_names=["image", "crop"], output_names=["feature_map", "score_map"],
+                          dynamic_axes={"image": {2: "Hp", 3: "Wp"},
+                                        "feature_map": {2: "Hp", 3: "Wp"},
+                                        "score_map": {2: "Hp", 3: "Wp"}})
         fm = torch.rand(1, 128, 128, 160)
         fm = F.normalize(fm, dim=1)
         crop = torch.tensor([4, 0, 120, 160])
@@ -236,11 +252,14 @@ def main():
             kpts_n, _, _ = original.dkd(sm_ref)
             desc_ref = original.desc_head(fm_ref, kpts_n)[0][0]
         padded, pad = pad32(rgb[:, :1])
-        fm_padded, sm = s_dense.run(None, {"image": padded.numpy()})
+        crop = np.array([pad[2], pad[0], h, w], dtype=np.int64)
+        fm_padded, sm = s_dense.run(None, {"image": padded.numpy(), "crop": crop})
+        outside = np.ones(fm_padded.shape[2:], bool)
+        outside[pad[2]:pad[2] + h, pad[0]:pad[0] + w] = False
+        assert not np.any(fm_padded[:, :, outside]), "feature map not zero outside the crop"
         fm = fm_padded[:, :, pad[2]:pad[2] + h, pad[0]:pad[0] + w]
         sm = sm[:, :, pad[2]:pad[2] + h, pad[0]:pad[0] + w]
         kpts_px = ((kpts_n[0] + 1) / 2 * torch.tensor([w - 1, h - 1])).numpy()
-        crop = np.array([pad[2], pad[0], h, w], dtype=np.int64)
         d = s_desc.run(None, {"feature_map": fm_padded, "crop": crop, "keypoints": kpts_px})[0]
         err_fm = float(np.abs(fm - fm_ref.numpy()).max())
         err_sm = float(np.abs(sm - sm_ref.numpy()).max())
